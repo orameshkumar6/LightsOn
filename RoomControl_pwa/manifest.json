@@ -1,7 +1,7 @@
 {
-  "name": "Room Controller",
-  "short_name": "RoomCtrl",
-  "description": "Control 6 room lights via Firebase + ESP32",
+  "name": "Lights On",
+  "short_name": "Lights On",
+  "description": "Smart room & slot booking system",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
