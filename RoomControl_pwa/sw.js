@@ -1,4 +1,4 @@
-const CACHE = 'roomctrl-fb-v12';
+const CACHE = 'roomctrl-fb-v13';
 const STATIC_ASSETS = [
   './manifest.json',
   './icons/icon-192.png',
@@ -56,6 +56,8 @@ self.addEventListener('fetch', e => {
   if (e.request.destination === 'document' ||
       e.request.url.endsWith('index.html') ||
       e.request.url.endsWith('product-info.js') ||
+      e.request.url.endsWith('license-registry.js') ||
+      e.request.url.endsWith('license-registry-config.js') ||
       e.request.url.endsWith('/')) {
     e.respondWith(
       fetch(e.request, { cache: 'no-store' })
