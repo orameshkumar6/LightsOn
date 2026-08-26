@@ -475,6 +475,16 @@
       <div id="logList"><div style="font-size:12px;color:var(--muted)">No activity yet</div></div>
     </div>
     <div class="settings-section license-exempt">
+      <div class="settings-title">Backup &amp; Restore</div>
+      <div class="settings-sub" style="padding:0 14px 8px">Export all settings, profiles, rooms, schedules, templates, and license key to a file. Restore from a previously exported backup.</div>
+      <div class="settings-row" style="gap:8px">
+        <button class="test-btn" style="margin:0;flex:1" onclick="backupAllData()">📥 Export Backup</button>
+        <button class="test-btn" style="margin:0;flex:1" onclick="document.getElementById('restoreFileInput').click()">📤 Restore from File</button>
+        <input type="file" id="restoreFileInput" accept=".json" style="display:none" onchange="restoreFromFile(event)">
+      </div>
+      <div id="backupRestoreMsg" class="status-msg" style="display:none;margin:8px 14px 0"></div>
+    </div>
+    <div class="settings-section license-exempt">
       <div class="settings-title">About</div>
       <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px;font-size:13px;color:var(--muted)" id="aboutProductInfo"></div>
     </div>
@@ -3259,6 +3269,109 @@ async function testConnection() {
     msg.className='status-msg err'; msg.textContent='✗ Connection failed — check URL and API key';
     setConnStatus(false);
   }
+}
+
+// ── Backup & Restore ─────────────────────────────────────────
+function backupAllData() {
+  const msgEl = document.getElementById('backupRestoreMsg');
+  try {
+    // Ensure current profile's rooms are captured
+    state.roomsByProfile = state.roomsByProfile || {};
+    state.roomsByProfile[state.activeProfileId] = state.rooms;
+
+    const backup = {
+      _meta: {
+        app: PRODUCT_INFO.name,
+        version: 'v4.0',
+        exportedAt: new Date().toISOString(),
+        deviceId: localStorage.getItem('lo_device_id') || 'unknown'
+      },
+      roomsByProfile: state.roomsByProfile,
+      profiles: state.profiles,
+      activeProfileId: state.activeProfileId,
+      licenseKey: state.licenseKey,
+      log: state.log
+    };
+
+    const json = JSON.stringify(backup, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const profileName = (getActiveProfile().name || 'backup').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const filename = `LightsOn_Backup_${profileName}_${dateStr}.json`;
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    if (msgEl) { msgEl.className = 'status-msg ok'; msgEl.textContent = '✓ Backup exported: ' + filename; msgEl.style.display = ''; }
+    showToast('✓ Backup exported');
+  } catch (e) {
+    if (msgEl) { msgEl.className = 'status-msg err'; msgEl.textContent = '✗ Backup failed: ' + e.message; msgEl.style.display = ''; }
+  }
+}
+
+function restoreFromFile(event) {
+  const msgEl = document.getElementById('backupRestoreMsg');
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = function (e) {
+    try {
+      const data = JSON.parse(e.target.result);
+
+      // Validate it looks like a Lights On backup
+      if (!data.profiles || !Array.isArray(data.profiles) || !data.roomsByProfile) {
+        throw new Error('This file does not appear to be a valid Lights On backup.');
+      }
+
+      // Confirm with user
+      const profileNames = data.profiles.map(p => p.name).join(', ');
+      const confirmMsg = `Restore backup?\n\nThis will replace ALL current data with:\n• ${data.profiles.length} profile(s): ${profileNames}\n• License: ${data.licenseKey ? 'Yes' : 'None'}\n• Exported: ${data._meta ? data._meta.exportedAt : 'unknown'}\n\nCurrent data will be lost. Continue?`;
+      if (!confirm(confirmMsg)) {
+        event.target.value = '';
+        return;
+      }
+
+      // Apply the backup
+      state.profiles = data.profiles;
+      state.activeProfileId = data.activeProfileId || data.profiles[0].id;
+      state.roomsByProfile = data.roomsByProfile;
+      state.licenseKey = data.licenseKey || null;
+      if (data.log) state.log = data.log;
+
+      // Load rooms for the active profile
+      const savedRooms = state.roomsByProfile[state.activeProfileId];
+      state.rooms = Array.isArray(savedRooms) ? savedRooms : makeBlankRooms();
+      state.rooms.forEach(r => {
+        if (r.slots) {
+          r.slots[0] = normalizeSlots(r.slots[0]);
+          r.slots[1] = normalizeSlots(r.slots[1]);
+        }
+      });
+
+      // Persist and refresh
+      persist();
+      refreshLicenseState();
+      renderDashboard();
+      renderSettings();
+      updateHeaderProfile();
+      applyProfileTint();
+
+      if (msgEl) { msgEl.className = 'status-msg ok'; msgEl.textContent = '✓ Restore complete — ' + data.profiles.length + ' profile(s) loaded'; msgEl.style.display = ''; }
+      showToast('✓ Data restored successfully');
+    } catch (err) {
+      if (msgEl) { msgEl.className = 'status-msg err'; msgEl.textContent = '✗ Restore failed: ' + err.message; msgEl.style.display = ''; }
+    }
+    event.target.value = ''; // reset file input
+  };
+  reader.readAsText(file);
 }
 
 // ── Log ───────────────────────────────────────────────────────
