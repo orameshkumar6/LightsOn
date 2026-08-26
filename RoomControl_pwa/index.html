@@ -286,7 +286,7 @@
     body.license-locked .slot-del {
       opacity: 0.45; pointer-events: none;
     }
-    /* ── Expired license — full app block ───────────────────── */
+    /* ── No active license — full app block ───────────────────── */
     .license-expired-blocker { position: fixed; inset: 0; z-index: 9999;
       background: var(--bg); display: none; align-items: center; justify-content: center;
       flex-direction: column; padding: 32px; text-align: center; }
@@ -302,12 +302,12 @@
   </style>
 </head>
 <body>
-<!-- Expired license full-screen blocker -->
+<!-- License blocker — full-screen block when no active license -->
 <div class="license-expired-blocker" id="licenseExpiredBlocker">
-  <div class="expired-icon">⏳</div>
-  <div class="expired-title">License Expired</div>
-  <div class="expired-msg" id="expiredBlockerMsg">Your license has expired. Please renew to continue using the application.</div>
-  <button class="expired-btn" onclick="openLicenseModal()">Enter New License Key</button>
+  <div class="expired-icon">🔒</div>
+  <div class="expired-title">No Active License</div>
+  <div class="expired-msg" id="expiredBlockerMsg">A valid license is required to use this application. Please enter your license key to continue.</div>
+  <button class="expired-btn" onclick="openLicenseModal()">Enter License Key</button>
   <div class="expired-contact" id="expiredBlockerContact"></div>
 </div>
 <div id="app">
@@ -3448,13 +3448,11 @@ function _licenseStatusMessage(result) {
   }
 }
 
-// Without a valid license the app stays fully open for day-to-day use —
-// viewing every page and toggling manual override on/off always works.
-// Only actions that change configuration or schedules (Settings edits,
-// slot/recurring creation, profile/room management) require an active
-// license. This flag is the single thing every gated action checks.
+// Without a valid license the app is fully blocked — only the license
+// entry modal is accessible. All features require an active license.
+// This flag is the single thing every gated action checks.
 let licenseValid = false;
-let _licenseExpiredReason = null; // tracks why license is invalid (e.g. 'expired') — drives hard-block UI
+let _licenseExpiredReason = null; // tracks why license is invalid (e.g. 'expired', 'invalid') — drives blocker UI messaging
 
 // Capacity caps carried by the license itself (maxRooms/maxProfiles) —
 // null means unlimited, either because the key predates these fields or
@@ -3486,21 +3484,34 @@ function requireCapacity(kind, currentCount, actionLabel) {
 function applyLicenseUIState() {
   document.body.classList.toggle('license-locked', !licenseValid);
   const banner = document.getElementById('licenseBanner');
-  if (banner) banner.style.display = licenseValid ? 'none' : '';
+  if (banner) banner.style.display = 'none'; // banner replaced by full blocker
 
-  // Expired license — block entire app
+  // No active license — block entire app regardless of reason
   const blocker = document.getElementById('licenseExpiredBlocker');
   if (blocker) {
-    const isExpired = !licenseValid && _licenseExpiredReason === 'expired';
-    blocker.classList.toggle('show', isExpired);
-    if (isExpired) {
+    blocker.classList.toggle('show', !licenseValid);
+    if (!licenseValid) {
       const obj = decodeLicenseKey(state.licenseKey) || {};
-      document.getElementById('expiredBlockerMsg').textContent =
-        `The license for "${obj.n || 'this device'}" expired on ${obj.t || 'unknown date'}. Please renew your license to continue using ${PRODUCT_INFO.name}.`;
+      const titleEl = blocker.querySelector('.expired-title');
+      const iconEl = blocker.querySelector('.expired-icon');
+      if (_licenseExpiredReason === 'expired') {
+        if (iconEl) iconEl.textContent = '⏳';
+        if (titleEl) titleEl.textContent = 'License Expired';
+        document.getElementById('expiredBlockerMsg').textContent =
+          `The license for "${obj.n || 'this device'}" expired on ${obj.t || 'unknown date'}. Please renew your license to continue using ${PRODUCT_INFO.name}.`;
+      } else if (!state.licenseKey) {
+        if (iconEl) iconEl.textContent = '🔒';
+        if (titleEl) titleEl.textContent = 'No Active License';
+        document.getElementById('expiredBlockerMsg').textContent =
+          `A valid license is required to use ${PRODUCT_INFO.name}. Please enter your license key to continue.`;
+      } else {
+        if (iconEl) iconEl.textContent = '⚠️';
+        if (titleEl) titleEl.textContent = 'License Invalid';
+        document.getElementById('expiredBlockerMsg').textContent =
+          `The license key could not be verified. Please enter a valid license key to continue using ${PRODUCT_INFO.name}.`;
+      }
       document.getElementById('expiredBlockerContact').innerHTML =
-        `Contact <a href="https://wa.me/${PRODUCT_INFO.whatsapp}" target="_blank" rel="noopener">WhatsApp ${PRODUCT_INFO.whatsapp}</a> or <a href="mailto:${PRODUCT_INFO.email}">${PRODUCT_INFO.email}</a> to renew.`;
-      // Hide the soft-gate banner when hard-block is showing
-      if (banner) banner.style.display = 'none';
+        `Contact <a href="https://wa.me/${PRODUCT_INFO.whatsapp}" target="_blank" rel="noopener">WhatsApp ${PRODUCT_INFO.whatsapp}</a> or <a href="mailto:${PRODUCT_INFO.email}">${PRODUCT_INFO.email}</a> for a license.`;
     }
   }
 }
