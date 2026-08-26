@@ -33,7 +33,7 @@ self.addEventListener('fetch', e => {
   // routed through this service worker's cache-then-network logic instead
   // of going straight to the network, which is never correct for
   // rapidly-changing real-time data.
-  if (e.request.url.includes('firebaseio.com') || e.request.url.includes('firebasedatabase.app')) return;
+  if (e.request.url.includes('firebaseio.com') || e.request.url.includes('firebasedatabase.app') || e.request.url.includes('googleapis.com')) return;
 
   // NEVER cache activate.html — always fetch fresh from network
   // This ensures slot data is always current

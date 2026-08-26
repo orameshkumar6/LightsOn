@@ -552,6 +552,8 @@
 </div>
 
 <script src="product-info.js"></script>
+<script src="license-registry-config.js"></script>
+<script src="license-registry.js"></script>
 <script>
 // ── State ────────────────────────────────────────────────────
 // Matches the ESP32 sketch's current hardcoded RELAY_PINS[]/LED_PINS[] wiring —
@@ -3422,7 +3424,7 @@ async function saveLicenseFromModal() {
 // ── Boot ──────────────────────────────────────────────────────
 hydrate();
 bootApp();
-refreshLicenseState();
+refreshLicenseState().then(function() { try { LicenseRegistry.report(); } catch(e) {} });
 startLicenseWatch();
 
 function bootApp() {
