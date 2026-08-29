@@ -39,6 +39,12 @@
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.35} }
     .conn-label { font-size: 12px; color: var(--muted); }
     .clock { font-size: 13px; color: var(--muted); }
+    .sync-btn { font-size: 12px; color: var(--accent); font-weight: 600; background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 4px 9px; cursor: pointer; min-height: 30px; white-space: nowrap; }
+    .sync-btn:hover { border-color: var(--accent); }
+    .sync-btn:disabled { opacity: 0.5; cursor: default; }
+    .sync-btn.syncing { color: var(--muted); }
+    @keyframes sync-spin { to { transform: rotate(360deg); } }
+    .sync-btn.syncing .sync-ico { display: inline-block; animation: sync-spin 0.8s linear infinite; }
 
     .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface); border-top: 1px solid var(--border); display: flex; z-index: 100; max-width: 600px; margin: 0 auto; }
     .nav-btn { flex: 1; padding: 10px 0 12px; display: flex; flex-direction: column; align-items: center; gap: 3px; background: none; border: none; color: var(--muted); font-size: 10px; cursor: pointer; }
@@ -334,6 +340,7 @@
       <div id="headerProfileArea"></div>
     </div>
     <div class="header-right">
+      <button class="sync-btn" id="syncBtn" onclick="manualSyncFromFirebase()" title="Pull the latest slots from Firebase (use if a slot added on another device isn't showing)"><span class="sync-ico" id="syncIco">↻</span> <span id="syncLabel">Sync</span></button>
       <div class="live-dot" id="liveDot"></div>
       <span class="conn-label" id="connLabel">Connecting…</span>
       <span class="clock" id="headerClock"></span>
@@ -2342,6 +2349,56 @@ async function checkDailySlotRefresh(p) {
   persist();
   renderDashboard();
   addLog('ok', 'Slots refreshed for today');
+}
+
+// ── Manual "Sync" — pull-and-replace slots from Firebase on demand ──────
+// Solves the multi-device case: structural slot changes (add/edit/delete)
+// are deliberately NOT live-synced (see the comment above startFbListener()
+// for the bugs that caused), so a slot created on another device won't show
+// here until this is tapped. Firebase is treated as authoritative: for every
+// room we replace the local today (slots) and tomorrow (slotsT) arrays with
+// whatever Firebase currently holds. Pull-only — never pushes — so it can't
+// clobber a newer remote edit with an older local one; edits made here were
+// already pushed to Firebase when they were saved.
+async function manualSyncFromFirebase() {
+  const p = getActiveProfile();
+  if (!p || !p.dbUrl) { showToast('Set a Firebase URL in Settings first'); return; }
+  const btn   = document.getElementById('syncBtn');
+  const label = document.getElementById('syncLabel');
+  if (btn && btn.disabled) return; // already syncing
+  if (btn)   { btn.disabled = true; btn.classList.add('syncing'); }
+  if (label) label.textContent = 'Syncing…';
+
+  try {
+    const data = await fbGet('/rooms', p);
+    if (!data || typeof data !== 'object') {
+      showToast('⚠️ Could not read from Firebase — check connection');
+      addLog('error', 'Manual sync: no data from Firebase');
+      return;
+    }
+    let updated = 0;
+    Object.keys(data).forEach(key => {
+      const idx = parseInt(key.replace('room', ''), 10) - 1;
+      if (idx < 0 || idx >= state.rooms.length) return;
+      const remote = data[key] || {};
+      // Firebase is authoritative for slot structure AND activation state on
+      // an explicit sync — replace both today and tomorrow wholesale.
+      state.rooms[idx].slots[0] = normalizeSlots(remote.slots);
+      state.rooms[idx].slots[1] = normalizeSlots(remote.slotsT);
+      updated++;
+    });
+    persist();
+    renderDashboard(); // timeline re-renders on its own when that tab is opened (showPage)
+    setConnStatus(true);
+    addLog('ok', 'Manual sync — slots pulled from Firebase');
+    showToast(`✓ Synced ${updated} room${updated === 1 ? '' : 's'} from Firebase`);
+  } catch (e) {
+    addLog('error', 'Manual sync failed: ' + e.message);
+    showToast('⚠️ Sync failed — check connection');
+  } finally {
+    if (btn)   { btn.disabled = false; btn.classList.remove('syncing'); }
+    if (label) label.textContent = 'Sync';
+  }
 }
 
 // ── Polling fallback when SSE fails ──────────────────────────
