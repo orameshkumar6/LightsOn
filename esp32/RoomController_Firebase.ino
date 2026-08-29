@@ -160,7 +160,7 @@ const unsigned long HEARTBEAT         = 300000; // heartbeat every 5 min
 
 // ── End-of-slot warning timing (non-blocking) ────────────────
 const unsigned long LED_BLINK_INTERVAL = 400;  // LED toggle period during a warning window
-const unsigned long BEEP_ON_MS         = 150;  // each beep's on-time within the attention burst
+const unsigned long BEEP_ON_MS         = 1000; // beep on-time — 1s pulse, suits a bell driven via relay
 const unsigned long BEEP_GAP_MS        = 150;  // silence between beeps in the burst
 const int           BEEP_BURST_COUNT   = 1;    // single beep at window start — one-shot, never continuous
 unsigned long lastLedBlinkToggle = 0;
@@ -400,6 +400,7 @@ void parseSlots(int idx, String json) {
       int objEnd   = json.indexOf('}', ei);
       bool isRecurring = false;
       bool isActivated = false;
+      bool isExpired   = false;
       if (objStart >= 0 && objEnd >= 0) {
         String slotObj = json.substring(objStart, objEnd + 1);
         // Recurring flag
@@ -412,8 +413,12 @@ void parseSlots(int idx, String json) {
         // Missing code field OR code is a string = requires activation
         bool codeIsNull = slotObj.indexOf("\"code\":null") >= 0;
         if (codeIsNull) isActivated = true;
+        // Expired flag — MUST be read back, otherwise every slot refresh
+        // resets it to false and checkSchedules() re-marks it expired on the
+        // next tick, spamming the log and re-writing Firebase every 10s.
+        isExpired = slotObj.indexOf("\"expired\":true") >= 0;
       }
-      tempSlots[tempCount++] = {sh, sm, eh, em, isRecurring, isActivated, false};
+      tempSlots[tempCount++] = {sh, sm, eh, em, isRecurring, isActivated, isExpired};
     }
     pos = max(si, ei) + 10;
   }
@@ -988,11 +993,15 @@ void checkSchedules() {
       int slotEnd   = rooms[i].slots[j].eh * 60 + rooms[i].slots[j].em;
       bool hasCode  = true; // assume code required (safe default)
 
-      // Slot just ended — check if it was never activated
-      // nm is just past slotEnd (within 10 seconds of end)
+      // Slot just ended — check if it was never activated. Guard on the
+      // local `expired` flag and latch it here so this fires exactly ONCE
+      // per slot: markSlotExpired() only writes to Firebase, so without
+      // this the check kept re-matching every 10s tick for the whole
+      // minute after slotEnd, spamming the log and re-writing Firebase.
       if (nm >= slotEnd && nm <= slotEnd + 1) {
-        if (!rooms[i].slots[j].activated && hasCode) {
-          // Slot ended without activation — mark expired
+        if (!rooms[i].slots[j].activated && hasCode && !rooms[i].slots[j].expired) {
+          // Slot ended without activation — mark expired (once)
+          rooms[i].slots[j].expired = true; // latch locally so we don't re-fire
           markSlotExpired(i, j);
         }
       }
