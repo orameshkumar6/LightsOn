@@ -2536,10 +2536,16 @@ async function pushRoom(idx, profile) {
   // Prune ghost slot entries left behind when the array shrinks (e.g.
   // after deleting a slot) — the loop above only ever PATCHes indices
   // still in use, so anything beyond today's count would otherwise sit
-  // in Firebase forever and get picked up by the ESP32's blind index
-  // scan alongside the real slots.
+  // in Firebase forever, get picked up by the ESP32's blind index scan,
+  // and reappear on the next pull-sync.
+  //
+  // IMPORTANT: Firebase RTDB serves contiguous 0,1,2,… keys back as a JSON
+  // ARRAY, not an object, so an earlier `!Array.isArray` guard here skipped
+  // pruning in the normal case and let deleted slots resurrect. Handle both
+  // shapes — Object.keys() gives "0","1",… for an array too — and null out
+  // every index at or beyond the current count.
   const existingSlots = await fbGet(`${roomBase}/slots`, p);
-  if (existingSlots && typeof existingSlots === 'object' && !Array.isArray(existingSlots)) {
+  if (existingSlots && typeof existingSlots === 'object') {
     for (const key of Object.keys(existingSlots)) {
       const ghostIdx = parseInt(key, 10);
       if (!isNaN(ghostIdx) && ghostIdx >= todaySlots.length) {
