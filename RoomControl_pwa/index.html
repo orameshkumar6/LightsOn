@@ -2378,10 +2378,21 @@ async function checkDailySlotRefresh(p) {
 //      slot arrays with Firebase's copy, so this device ends up matching it.
 // Pull runs even if the push partially failed, so the device still converges
 // to whatever Firebase actually holds.
-// silent=true suppresses toasts and the "Set a Firebase URL" nudge — used
-// for the automatic sync on page load (see bootApp()). The button spinner/
-// disabled handling still runs either way.
-async function manualSyncFromFirebase(silent) {
+// opts.silent   — suppress toasts/nudges (used by the on-load auto-sync).
+// opts.pushFirst — when true, PUSH local changes up first, then pull. When
+//   false, PULL-ONLY (Firebase is authoritative, local is replaced).
+//
+// The manual Sync button uses pushFirst=true (upload my edits, then
+// reconcile). The on-load/refresh sync uses pushFirst=FALSE — critical for
+// multi-device: on a fresh page load there are no in-session edits to
+// upload (edits already auto-push the moment they're made), so pushing the
+// stale cached copy would re-upload slots another device just deleted and
+// resurrect them. Pull-only on load takes Firebase as truth, so deletions
+// made elsewhere stick.
+async function manualSyncFromFirebase(opts) {
+  opts = opts || {};
+  const silent    = !!opts.silent;
+  const pushFirst = opts.pushFirst !== false; // default true (manual button)
   const p = getActiveProfile();
   if (!p || !p.dbUrl) { if (!silent) showToast('Set a Firebase URL in Settings first'); return; }
   const btn   = document.getElementById('syncBtn');
@@ -2391,15 +2402,17 @@ async function manualSyncFromFirebase(silent) {
   if (label) label.textContent = 'Syncing…';
 
   try {
-    // ── 1. PUSH local changes for this profile up to Firebase ──
+    // ── 1. PUSH local changes for this profile up to Firebase (manual only) ──
     // Pinned profile reference so every write in the loop targets the same
     // database even if the user switches profiles mid-sync.
     let pushOk = true;
-    try {
-      pushOk = await pushAllRooms(p);
-    } catch (e) {
-      pushOk = false;
-      addLog('error', 'Sync push failed: ' + e.message);
+    if (pushFirst) {
+      try {
+        pushOk = await pushAllRooms(p);
+      } catch (e) {
+        pushOk = false;
+        addLog('error', 'Sync push failed: ' + e.message);
+      }
     }
 
     // ── 2. PULL authoritative copy back and replace local ──
@@ -2423,7 +2436,7 @@ async function manualSyncFromFirebase(silent) {
     persist();
     renderDashboard(); // timeline re-renders on its own when that tab is opened (showPage)
     setConnStatus(true);
-    addLog('ok', (silent ? 'Auto' : 'Manual') + ' sync — pushed local, replaced with Firebase');
+    addLog('ok', (silent ? 'Auto' : 'Manual') + ' sync — ' + (pushFirst ? 'pushed local, replaced with Firebase' : 'pulled Firebase (pull-only)'));
     if (!silent) showToast(pushOk
       ? `✓ Synced ${updated} room${updated === 1 ? '' : 's'} with Firebase`
       : `✓ Synced from Firebase (some local changes may not have uploaded — check connection)`);
@@ -3966,8 +3979,10 @@ function bootApp() {
   if (getActiveProfile().dbUrl) {
     startFbListener();
     checkDailySlotRefresh(getActiveProfile()); // once per profile per day — see function comment
-    manualSyncFromFirebase(true); // auto pull-and-replace slots on page load (silent) so a
-                                  // reload picks up slots added/edited on another device
+    manualSyncFromFirebase({ silent: true, pushFirst: false }); // on page load: PULL-ONLY.
+      // No in-session edits exist yet (edits auto-push when made), so pushing the
+      // stale cached copy would resurrect slots another device just deleted. Taking
+      // Firebase as truth here makes cross-device deletions stick on refresh.
   }
   renderDashboard();
 
