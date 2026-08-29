@@ -153,14 +153,14 @@ bool          timeSynced        = false; // set once in setup() from getLocalTim
 int lastRolloverDay = -1;
 
 // Intervals
-const unsigned long POLL_INTERVAL     = 5000;   // override poll every 5 sec
+const unsigned long POLL_INTERVAL     = 3000;   // override poll every 3 sec
 const unsigned long SCHEDULE_INTERVAL = 10000;  // schedule check every 10 sec
 const unsigned long SLOT_REFRESH      = 10000;  // slot refresh every 10 sec — picks up activation fast
 const unsigned long HEARTBEAT         = 300000; // heartbeat every 5 min
 
 // ── End-of-slot warning timing (non-blocking) ────────────────
 const unsigned long LED_BLINK_INTERVAL = 400;  // LED toggle period during a warning window
-const unsigned long BEEP_ON_MS         = 1000; // beep on-time — 1s pulse, suits a bell driven via relay
+const unsigned long BEEP_ON_MS         = 5000; // beep on-time — 5s pulse for a bell driven via relay
 const unsigned long BEEP_GAP_MS        = 150;  // silence between beeps in the burst
 const int           BEEP_BURST_COUNT   = 1;    // single beep at window start — one-shot, never continuous
 unsigned long lastLedBlinkToggle = 0;
@@ -911,9 +911,13 @@ bool inWarningWindow(int idx) {
 
 // Kick off the one-shot attention burst on the shared beeper. Non-blocking:
 // the actual on/off toggling happens in serviceBeeper() from loop(). No-op
-// if no beeper pin is configured.
+// if no beeper pin is configured, OR if a burst is already in progress —
+// so when several rooms enter their warning window together (e.g. multiple
+// slots ending at the same time), the shared bell rings exactly ONCE rather
+// than being re-triggered/extended per room.
 void startBeepBurst() {
   if (beeperPin < 0) return;
+  if (beepsRemaining > 0) return; // a ring is already sounding — don't re-arm it
   beepsRemaining = BEEP_BURST_COUNT;
   beepOnPhase    = true;
   beepPhaseUntil = millis() + BEEP_ON_MS;
