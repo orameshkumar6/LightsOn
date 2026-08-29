@@ -147,6 +147,15 @@
     .modal-time { flex: 1; background: var(--card2); border: 1px solid var(--border);
       border-radius: 8px; color: var(--text); font-size: 15px; padding: 10px 12px;
       min-height: 44px; }
+    .modal-adjust-row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+    .modal-adjust-btn { flex: 1; padding: 8px 6px; border-radius: 8px;
+      border: 1px solid var(--accent); background: transparent; color: var(--accent);
+      font-size: 13px; cursor: pointer; min-height: 40px; white-space: nowrap; }
+    .modal-adjust-btn:hover { background: rgba(74,143,255,0.12); }
+    .modal-adjust-btn-wide { flex: 2; }
+    .modal-adjust-input { width: 80px; flex-shrink: 0; background: var(--card2);
+      border: 1px solid var(--border); border-radius: 8px; color: var(--text);
+      font-size: 15px; padding: 8px 10px; min-height: 40px; text-align: center; }
     .modal-check-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
     .modal-check-row input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--amber); flex-shrink: 0; }
     .modal-check-label { font-size: 13px; color: var(--muted); }
@@ -1255,6 +1264,7 @@ async function saveRecurringFromModal() {
 // ── Slot Modal ────────────────────────────────────────────────
 let modalRoomId  = null;
 let modalDay     = 0;
+let editingSlotIdx = null; // null = adding a new slot; a number = editing that slot index
 
 // ── Day-view 30-min time picker (inside the slot modal) ────────
 let modalGridBuilt    = false;
@@ -1364,10 +1374,12 @@ function renderGridOccupancy() {
 
 function openSlotModal(roomId) {
   if (!requireLicense('add a slot')) return;
+  editingSlotIdx = null; // add mode
   modalRoomId = roomId;
   modalDay    = state.schedDay;
   const r     = state.rooms.find(x => x.id === roomId);
   document.getElementById('modalTitle').textContent = 'Add Slot — ' + r.name;
+  document.getElementById('slotModalSaveBtn').textContent = '+ Add Slot';
   // Reset form
   document.getElementById('m_start').value    = '09:00';
   document.getElementById('m_end').value      = '10:00';
@@ -1391,9 +1403,49 @@ function openSlotModal(roomId) {
   document.getElementById('slotModal').classList.add('show');
 }
 
+// Opens the same modal preloaded with an existing slot's details for editing.
+// Reuses the whole add-slot form; saveSlotFromModal() updates in place when
+// editingSlotIdx is set instead of pushing a new slot.
+function openSlotModalEdit(roomId, slotIdx) {
+  if (!requireLicense('edit a slot')) return;
+  const r = state.rooms.find(x => x.id === roomId);
+  if (!r) return;
+  const slot = (r.slots[state.schedDay] || [])[slotIdx];
+  if (!slot) { showToast('Slot not found'); return; }
+
+  editingSlotIdx = slotIdx; // edit mode
+  modalRoomId = roomId;
+  modalDay    = state.schedDay;
+  document.getElementById('modalTitle').textContent = 'Edit Slot — ' + r.name;
+  document.getElementById('slotModalSaveBtn').textContent = '✓ Save Changes';
+  // Prefill from the existing slot
+  document.getElementById('m_start').value    = slot.s || '09:00';
+  document.getElementById('m_end').value      = slot.e || '10:00';
+  document.getElementById('m_code').value     = slot.code || '';
+  document.getElementById('m_name').value     = slot.bookedBy || '';
+  document.getElementById('m_phone').value    = slot.phone || '';
+  const hasCode = !!slot.code;
+  document.getElementById('m_reqcode').checked = hasCode;
+  document.getElementById('m_recurring').checked = !!slot.recurring;
+  document.getElementById('m_coderow').style.opacity = hasCode ? '1' : '0.3';
+  document.getElementById('m_coderow').style.pointerEvents = hasCode ? '' : 'none';
+  if (!modalGridBuilt) {
+    document.getElementById('modalTimeGrid').innerHTML = buildTimeGridHtml();
+    modalGridBuilt = true;
+  }
+  // setModalDay() re-enables/labels the recurring checkbox for the current
+  // day, so re-apply the slot's recurring state afterwards for today's slots.
+  setModalDay(state.schedDay);
+  if (state.schedDay === 0) document.getElementById('m_recurring').checked = !!slot.recurring;
+  syncGridFromModalTimes(); // highlight the slot's range on the grid
+  modalToggleRecurring(false);
+  document.getElementById('slotModal').classList.add('show');
+}
+
 function closeSlotModal() {
   document.getElementById('slotModal').classList.remove('show');
   modalRoomId = null;
+  editingSlotIdx = null;
 }
 
 function modalBackdropClick(e) {
@@ -1437,8 +1489,52 @@ function modalRefreshCode() {
   setTimeout(() => el.style.borderColor = '', 1000);
 }
 
+// ── Modal time quick-adjust helpers ───────────────────────────
+// All work on the modal's Start/End <input type=time> fields (not the saved
+// slot) so the same buttons work whether adding or editing — the change is
+// only committed when Save is pressed. Minutes are clamped to the same day
+// (00:00–23:59) so a bump can't silently wrap past midnight.
+function minsToTimeStr(mins) {
+  const clamped = Math.max(0, Math.min(23*60+59, mins));
+  return String(Math.floor(clamped/60)).padStart(2,'0') + ':' + String(clamped%60).padStart(2,'0');
+}
+
+function flashModalTime(el) {
+  el.style.borderColor = 'var(--green)';
+  setTimeout(() => el.style.borderColor = '', 700);
+}
+
+// +5m / +10m — extend only the end time by the given minutes.
+function bumpEnd(mins) {
+  const endEl = document.getElementById('m_end');
+  if (!endEl.value) { showToast('⚠️ Set an end time first'); return; }
+  endEl.value = minsToTimeStr(toMinsStr(endEl.value) + mins);
+  flashModalTime(endEl);
+  syncGridFromModalTimes();
+}
+
+// Move slot by N minutes — shift BOTH start and end by the entered value
+// (negative moves the slot earlier). Preserves the slot's duration.
+function moveSlotBy() {
+  const startEl = document.getElementById('m_start');
+  const endEl   = document.getElementById('m_end');
+  if (!startEl.value || !endEl.value) { showToast('⚠️ Set start and end times first'); return; }
+  const delta = parseInt(document.getElementById('m_moveBy').value, 10);
+  if (isNaN(delta)) { showToast('⚠️ Enter a number of minutes'); return; }
+  const startM = toMinsStr(startEl.value) + delta;
+  const endM   = toMinsStr(endEl.value) + delta;
+  // Refuse a shift that would push either edge outside the day rather than
+  // silently clamping and changing the duration.
+  if (startM < 0 || endM > 23*60+59) { showToast('⚠️ Move would go outside the day'); return; }
+  startEl.value = minsToTimeStr(startM);
+  endEl.value   = minsToTimeStr(endM);
+  flashModalTime(startEl); flashModalTime(endEl);
+  syncGridFromModalTimes();
+}
+
 async function saveSlotFromModal() {
-  if (!requireLicense('add a slot')) return;
+  const isEdit = editingSlotIdx !== null;
+  if (!requireLicense(isEdit ? 'edit a slot' : 'add a slot')) return;
   if (!modalRoomId) return;
   const r = state.rooms.find(x => x.id === modalRoomId);
   const s = document.getElementById('m_start').value;
@@ -1446,9 +1542,9 @@ async function saveSlotFromModal() {
 
   if (!s || !e || s >= e) { showToast('⚠️ Invalid time range'); return; }
 
-  // Check for duplicate slot times
+  // Check for duplicate slot times — when editing, ignore the slot being edited
   const existing = r.slots[modalDay] || [];
-  const dup = existing.find(sl => sl.s === s && sl.e === e);
+  const dup = existing.find((sl, idx) => sl.s === s && sl.e === e && !(isEdit && idx === editingSlotIdx));
   if (dup) { showToast('⚠️ Slot already exists'); return; }
 
   const requireCode  = document.getElementById('m_reqcode').checked;
@@ -1470,6 +1566,50 @@ async function saveSlotFromModal() {
   }
 
   if (!r.slots[modalDay]) r.slots[modalDay] = [];
+
+  if (isEdit) {
+    const slot = r.slots[modalDay][editingSlotIdx];
+    if (!slot) { showToast('Slot not found'); closeSlotModal(); return; }
+    // Changing the time or the code invalidates any prior activation, so
+    // reset the activation state (same fields editSlotCode() clears) when
+    // any of those change. Otherwise leave a live activation untouched.
+    const timeChanged = slot.s !== s || slot.e !== e;
+    const codeChanged = (slot.code || null) !== (slotCode || null);
+    slot.s = s;
+    slot.e = e;
+    slot.recurring = recurring;
+    slot.code = slotCode;
+    slot.bookedBy = bookedBy;
+    slot.phone = phone;
+    slot.date = dateStr;
+    slot.expired = false;
+    if (timeChanged || codeChanged) {
+      slot.activatedAt = null;
+      slot.activatedBy = null;
+      slot.attempts    = 0;
+      slot.lockedUntil = null;
+    }
+    const savedRoomId = modalRoomId;
+    const savedIdx    = editingSlotIdx;
+    const resetActivation = timeChanged || codeChanged;
+    closeSlotModal();
+    persist();
+    const p = getActiveProfile(); // pin once — same db for both writes below
+    await pushRoom(savedRoomId - 1, p);
+    // pushRoom()'s per-slot write intentionally excludes activation fields so
+    // routine saves can't clobber a real activation from activate.html. When
+    // this edit reset them, mirror editSlotCode()/deactivateSlot() with a
+    // direct patch, or the stale activation in Firebase syncs right back.
+    if (resetActivation) {
+      await fbPatch(`/rooms/room${savedRoomId}/slots/${savedIdx}`, {
+        activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null
+      }, p);
+    }
+    renderDashboard();
+    showToast('✓ Slot updated');
+    return;
+  }
+
   r.slots[modalDay].push({
     s: s, e: e, recurring,
     code: slotCode,
@@ -2763,6 +2903,7 @@ function renderRoomCard(r) {
                 ${!isActive && !isLocked && !isExpired ? `<button class="slot-activate-btn" onclick="activateSlot(${r.id},${i})">Activate</button>` : ''}
                 ${isActive ? `<button class="slot-deactivate-btn" onclick="deactivateSlot(${r.id},${i})">Deactivate</button>` : ''}
                 ${s.phone ? `<button class="slot-activate-btn" style="border-color:var(--green);color:var(--green)" onclick="sendSlotWhatsAppReminder(${r.id},${i})" title="Send WhatsApp reminder to ${s.bookedBy || s.phone}">💬</button>` : ''}
+                <button class="slot-activate-btn" onclick="openSlotModalEdit(${r.id},${i})" title="Edit slot timings">Edit</button>
                 <button class="slot-del" onclick="deleteSlot(${r.id},${i})">×</button>
               </div>
             </div>`;}).join('')
@@ -3715,6 +3856,14 @@ function applyUpdate() {
           <label class="modal-label" for="m_end">End</label>
           <input class="modal-time" type="time" id="m_end" value="10:00" oninput="syncGridFromModalTimes()">
         </div>
+        <div class="modal-adjust-row">
+          <button class="modal-adjust-btn" onclick="bumpEnd(5)" title="Add 5 minutes to end time">+5m end</button>
+          <button class="modal-adjust-btn" onclick="bumpEnd(10)" title="Add 10 minutes to end time">+10m end</button>
+        </div>
+        <div class="modal-adjust-row">
+          <input class="modal-adjust-input" type="number" id="m_moveBy" value="15" step="5" title="Minutes to shift (negative = earlier)">
+          <button class="modal-adjust-btn modal-adjust-btn-wide" onclick="moveSlotBy()" title="Shift both start and end by this many minutes">Move slot by min</button>
+        </div>
         <div class="modal-divider"></div>
         <div class="modal-check-row">
           <input type="checkbox" id="m_reqcode" checked onchange="modalToggleCode(this.checked)">
@@ -3740,7 +3889,7 @@ function applyUpdate() {
           <input type="checkbox" id="m_recurring" onchange="modalToggleRecurring(this.checked)">
           <label class="modal-check-label" id="m_recurlabel" for="m_recurring">Repeat daily (recurring)</label>
         </div>
-        <button class="modal-save-btn" onclick="saveSlotFromModal()">+ Add Slot</button>
+        <button class="modal-save-btn" id="slotModalSaveBtn" onclick="saveSlotFromModal()">+ Add Slot</button>
         <button class="modal-cancel-btn" onclick="closeSlotModal()">Cancel</button>
       </div>
     </div>
