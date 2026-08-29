@@ -2360,9 +2360,12 @@ async function checkDailySlotRefresh(p) {
 // whatever Firebase currently holds. Pull-only — never pushes — so it can't
 // clobber a newer remote edit with an older local one; edits made here were
 // already pushed to Firebase when they were saved.
-async function manualSyncFromFirebase() {
+// silent=true suppresses toasts and the "Set a Firebase URL" nudge — used
+// for the automatic sync on page load (see bootApp()), where those would be
+// noise. The button spinner/disabled handling still runs either way.
+async function manualSyncFromFirebase(silent) {
   const p = getActiveProfile();
-  if (!p || !p.dbUrl) { showToast('Set a Firebase URL in Settings first'); return; }
+  if (!p || !p.dbUrl) { if (!silent) showToast('Set a Firebase URL in Settings first'); return; }
   const btn   = document.getElementById('syncBtn');
   const label = document.getElementById('syncLabel');
   if (btn && btn.disabled) return; // already syncing
@@ -2372,8 +2375,8 @@ async function manualSyncFromFirebase() {
   try {
     const data = await fbGet('/rooms', p);
     if (!data || typeof data !== 'object') {
-      showToast('⚠️ Could not read from Firebase — check connection');
-      addLog('error', 'Manual sync: no data from Firebase');
+      if (!silent) showToast('⚠️ Could not read from Firebase — check connection');
+      addLog('error', 'Sync: no data from Firebase');
       return;
     }
     let updated = 0;
@@ -2390,11 +2393,11 @@ async function manualSyncFromFirebase() {
     persist();
     renderDashboard(); // timeline re-renders on its own when that tab is opened (showPage)
     setConnStatus(true);
-    addLog('ok', 'Manual sync — slots pulled from Firebase');
-    showToast(`✓ Synced ${updated} room${updated === 1 ? '' : 's'} from Firebase`);
+    addLog('ok', (silent ? 'Auto' : 'Manual') + ' sync — slots pulled from Firebase');
+    if (!silent) showToast(`✓ Synced ${updated} room${updated === 1 ? '' : 's'} from Firebase`);
   } catch (e) {
-    addLog('error', 'Manual sync failed: ' + e.message);
-    showToast('⚠️ Sync failed — check connection');
+    addLog('error', 'Sync failed: ' + e.message);
+    if (!silent) showToast('⚠️ Sync failed — check connection');
   } finally {
     if (btn)   { btn.disabled = false; btn.classList.remove('syncing'); }
     if (label) label.textContent = 'Sync';
@@ -3837,6 +3840,8 @@ function bootApp() {
   if (getActiveProfile().dbUrl) {
     startFbListener();
     checkDailySlotRefresh(getActiveProfile()); // once per profile per day — see function comment
+    manualSyncFromFirebase(true); // auto pull-and-replace slots on page load (silent) so a
+                                  // reload picks up slots added/edited on another device
   }
   renderDashboard();
 
