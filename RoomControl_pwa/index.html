@@ -124,6 +124,15 @@
     .copy-day-btn { flex: 1; padding: 6px; border-radius: 8px; border: 1px solid var(--border); background: transparent; font-size: 12px; color: var(--muted); cursor: pointer; }
     .copy-day-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
     .copy-btn { width: 100%; padding: 8px; border-radius: 8px; border: 1px solid var(--green); background: transparent; color: var(--green); font-size: 13px; cursor: pointer; }
+    .copy-slotsel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+    .copy-selall-btn { font-size: 11px; color: var(--accent); background: transparent; border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; cursor: pointer; }
+    .copy-selall-btn:hover { border-color: var(--accent); }
+    .copy-slot-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+    .copy-slot-item { display: flex; align-items: center; gap: 8px; padding: 6px 9px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; text-align: left; }
+    .copy-slot-item.selected { border-color: var(--accent); background: rgba(74,143,255,0.12); color: var(--text); }
+    .copy-slot-check { width: 14px; flex-shrink: 0; color: var(--accent); font-weight: 700; }
+    .copy-slot-time { flex: 1; font-variant-numeric: tabular-nums; }
+    .copy-slot-tag { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
 
     .seg-row { display: flex; gap: 6px; margin-bottom: 12px; }
     .seg-btn { flex: 1; padding: 7px 0; border-radius: 8px; border: 1px solid var(--border); background: transparent; font-size: 12px; color: var(--muted); cursor: pointer; }
@@ -2790,7 +2799,56 @@ async function allRooms(val) {
 }
 
 // ── Copy slots state ─────────────────────────────────────────
-const copyState = { selectedRooms: [], sources: ['today','tomorrow','recurring'] };
+// sources = which category of slots to offer for selection (today /
+// tomorrow / recurring). selectedByRoom maps a source room id → a Set of
+// ticked slot keys ("day:index", see copyCandidateKey). Per-room because
+// multiple room panels can be open at once (see toggleRoom). A room absent
+// from the map means "not initialised" → defaults to all-selected the first
+// time its panel is shown, matching the old copy-everything behavior.
+const copyState = { selectedRooms: [], sources: ['today','tomorrow','recurring'], selectedByRoom: {} };
+
+function copyCandidateKey(day, idx) { return day + ':' + idx; }
+
+// Builds the list of individual slots eligible to copy from the source room,
+// honoring the today/tomorrow/recurring category toggles. Each entry carries
+// the slot plus its day (0=today,1=tomorrow) and original index, so copySlots
+// can place it correctly and selection survives re-renders.
+function copyCandidates(fromRoom) {
+  if (!fromRoom) return [];
+  const wantToday     = copyState.sources.includes('today');
+  const wantTomorrow  = copyState.sources.includes('tomorrow');
+  const wantRecurring = copyState.sources.includes('recurring');
+  const out = [];
+  const day0 = normalizeSlots(fromRoom.slots[0]);
+  day0.forEach((sl, idx) => {
+    // A recurring slot shows when either Today or Recurring is on; a
+    // one-time today slot shows only when Today is on.
+    const show = sl.recurring ? (wantToday || wantRecurring) : wantToday;
+    if (show) out.push({ slot: sl, day: 0, idx });
+  });
+  if (wantTomorrow) {
+    normalizeSlots(fromRoom.slots[1]).forEach((sl, idx) => out.push({ slot: sl, day: 1, idx }));
+  }
+  return out;
+}
+
+// Ensures this room's selection Set exists and is pruned to currently-valid
+// candidate keys. On first view, defaults to every candidate selected —
+// preserving the old "copies all slots" behavior until the user unticks
+// something. Returns { cands, sel } for the caller.
+function ensureCopySelection(fromRoom) {
+  const cands = copyCandidates(fromRoom);
+  const validKeys = new Set(cands.map(c => copyCandidateKey(c.day, c.idx)));
+  let sel = copyState.selectedByRoom[fromRoom.id];
+  if (!sel) {
+    sel = new Set(validKeys); // first view — all selected
+    copyState.selectedByRoom[fromRoom.id] = sel;
+  } else {
+    // Drop any keys no longer valid (e.g. a category was turned off).
+    [...sel].forEach(k => { if (!validKeys.has(k)) sel.delete(k); });
+  }
+  return { cands, sel };
+}
 
 function toggleCopyRoom(id) {
   const idx = copyState.selectedRooms.indexOf(id);
@@ -2807,6 +2865,29 @@ function toggleCopySource(src) {
   } else {
     copyState.sources.push(src);
   }
+  // Category set changed — re-seed every room's selection so newly-shown
+  // slots default to selected and hidden ones drop out (ensureCopySelection
+  // rebuilds on next render for whichever rooms are open).
+  copyState.selectedByRoom = {};
+  renderDashboard();
+}
+
+function toggleCopySlot(fromId, day, idx) {
+  const fromRoom = state.rooms.find(r => r.id === fromId);
+  const { sel } = ensureCopySelection(fromRoom);
+  const key = copyCandidateKey(day, idx);
+  if (sel.has(key)) sel.delete(key);
+  else sel.add(key);
+  renderDashboard();
+}
+
+// Select-all / clear-all toggle for the source slot checklist.
+function toggleCopySelectAll(fromId) {
+  const fromRoom = state.rooms.find(r => r.id === fromId);
+  const { cands, sel } = ensureCopySelection(fromRoom);
+  const allKeys = cands.map(c => copyCandidateKey(c.day, c.idx));
+  const allSelected = allKeys.length > 0 && allKeys.every(k => sel.has(k));
+  copyState.selectedByRoom[fromId] = new Set(allSelected ? [] : allKeys);
   renderDashboard();
 }
 
@@ -2821,24 +2902,20 @@ async function copySlots(fromId) {
   const p = getActiveProfile();
   const fromRoom = state.rooms.find(r => r.id === fromId);
 
-  // Collect what to copy based on selected sources
-  const copyToday     = copyState.sources.includes('today');
-  const copyTomorrow  = copyState.sources.includes('tomorrow');
-  const copyRecurring = copyState.sources.includes('recurring');
+  // Copy only the individually-selected slots. ensureCopySelection() keeps
+  // this room's selection seeded/pruned; here we just partition the ticked
+  // ones into day 0 (today + recurring) and day 1 (tomorrow), preserving each
+  // slot's original day so it lands in the right place.
+  const { cands, sel } = ensureCopySelection(fromRoom);
+  const chosen = cands.filter(c => sel.has(copyCandidateKey(c.day, c.idx)));
 
-  // Get today slots — optionally filter to recurring only or non-recurring only
-  const todaySlots     = copyToday
-    ? (fromRoom.slots[0] || []).filter(s => copyRecurring ? true : !s.recurring)
-    : [];
-  const recurringSlots = copyRecurring && !copyToday
-    ? (fromRoom.slots[0] || []).filter(s => s.recurring)
-    : [];
-  const tomorrowSlots  = copyTomorrow ? (fromRoom.slots[1] || []) : [];
+  const chosenDay0    = chosen.filter(c => c.day === 0).map(c => c.slot); // today + recurring
+  const tomorrowSlots = chosen.filter(c => c.day === 1).map(c => c.slot);
 
-  const allCopySlots = [...todaySlots, ...recurringSlots, ...tomorrowSlots];
+  const allCopySlots = [...chosenDay0, ...tomorrowSlots];
 
   if (allCopySlots.length === 0) {
-    showToast('No slots found for selected sources'); return;
+    showToast('Select at least one slot to copy'); return;
   }
 
   let copied = 0;
@@ -2854,7 +2931,7 @@ async function copySlots(fromId) {
     // (untouched by this copy) may have a real activation in Firebase from
     // activate.html that hasn't synced to this browser yet; overwriting the
     // whole array with this client's local snapshot would silently erase it.
-    const day0slots = [...todaySlots, ...recurringSlots];
+    const day0slots = chosenDay0;
     if (day0slots.length > 0) {
       if (!toRoom.slots[0]) toRoom.slots[0] = [];
       const startIdx = normalizeSlots(toRoom.slots[0]).length;
@@ -2900,9 +2977,9 @@ async function copySlots(fromId) {
 
   persist();
   copyState.selectedRooms = [];
+  delete copyState.selectedByRoom[fromId]; // re-seed (all selected) next time this room's panel opens
   renderDashboard();
-  const srcLabel = copyState.sources.join(' + ');
-  showToast(`✓ Copied ${allCopySlots.length} slots to ${copied} room${copied>1?'s':''}`);
+  showToast(`✓ Copied ${allCopySlots.length} slot${allCopySlots.length===1?'':'s'} to ${copied} room${copied>1?'s':''}`);
 }
 
 // ── Render Dashboard ─────────────────────────────────────────
@@ -2996,6 +3073,26 @@ function renderRoomCard(r) {
             <button class="copy-day-btn${copyState.sources.includes('tomorrow') ? ' active' : ''}" onclick="toggleCopySource('tomorrow')">Tomorrow</button>
             <button class="copy-day-btn${copyState.sources.includes('recurring') ? ' active' : ''}" onclick="toggleCopySource('recurring')" style="border-color:var(--green);${copyState.sources.includes('recurring') ? 'background:var(--green);color:white;' : 'color:var(--green);'}">Recurring</button>
           </div>
+          ${(() => {
+            const { cands, sel } = ensureCopySelection(r);
+            if (cands.length === 0) return `<div style="font-size:11px;color:var(--muted);margin-bottom:6px">No slots to copy for the selected categories.</div>`;
+            const allSelected = cands.every(c => sel.has(copyCandidateKey(c.day, c.idx)));
+            const selCount = cands.filter(c => sel.has(copyCandidateKey(c.day, c.idx))).length;
+            return `<div class="copy-slotsel-head">
+                <span style="font-size:11px;color:var(--muted)">Slots (${selCount}/${cands.length}):</span>
+                <button class="copy-selall-btn" onclick="toggleCopySelectAll(${r.id})">${allSelected ? 'Clear all' : 'Select all'}</button>
+              </div>
+              <div class="copy-slot-list">${cands.map(c => {
+                const on = sel.has(copyCandidateKey(c.day, c.idx));
+                const tag = c.day === 1 ? 'Tom' : (c.slot.recurring ? 'Rec' : 'Today');
+                const tagCol = c.day === 1 ? 'var(--accent)' : (c.slot.recurring ? 'var(--green)' : 'var(--muted)');
+                return `<button class="copy-slot-item${on ? ' selected' : ''}" onclick="toggleCopySlot(${r.id},${c.day},${c.idx})">
+                  <span class="copy-slot-check">${on ? '✓' : ''}</span>
+                  <span class="copy-slot-time">${c.slot.s} – ${c.slot.e}</span>
+                  <span class="copy-slot-tag" style="color:${tagCol}">${tag}</span>
+                </button>`;
+              }).join('')}</div>`;
+          })()}
           <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Copy to:</div>
           <div class="copy-grid">${state.rooms.filter(x=>x.id!==r.id).map(x=>`
             <button class="copy-room-btn${copyState.selectedRooms.includes(x.id)?' selected':''}" onclick="toggleCopyRoom(${x.id})">${x.name}</button>
