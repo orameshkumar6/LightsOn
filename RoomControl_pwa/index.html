@@ -349,7 +349,7 @@
       <div id="headerProfileArea"></div>
     </div>
     <div class="header-right">
-      <button class="sync-btn" id="syncBtn" onclick="manualSyncFromFirebase()" title="Push this profile's local changes to Firebase, then replace the local copy with Firebase's latest"><span class="sync-ico" id="syncIco">↻</span> <span id="syncLabel">Sync</span></button>
+      <button class="sync-btn" id="syncBtn" onclick="manualSyncFromFirebase()" title="Upload any unsaved local changes, then pull the latest data for this profile from Firebase"><span class="sync-ico" id="syncIco">↻</span> <span id="syncLabel">Sync</span></button>
       <div class="live-dot" id="liveDot"></div>
       <span class="conn-label" id="connLabel">Connecting…</span>
       <span class="clock" id="headerClock"></span>
@@ -1216,6 +1216,7 @@ async function confirmBookingImport() {
   };
   if (!r.slots[0]) r.slots[0] = [];
   r.slots[0].push(slot);
+  markRoomDirty(r.id - 1);
   persist();
   await pushRoom(r.id - 1); // same write path Add Slot already uses — s/e/recurring/code/date only
   renderDashboard();
@@ -1621,6 +1622,7 @@ async function saveSlotFromModal() {
     const savedIdx    = editingSlotIdx;
     const resetActivation = timeChanged || codeChanged;
     closeSlotModal();
+    markRoomDirty(savedRoomId - 1);
     persist();
     const p = getActiveProfile(); // pin once — same db for both writes below
     await pushRoom(savedRoomId - 1, p);
@@ -1650,6 +1652,7 @@ async function saveSlotFromModal() {
 
   const savedRoomId = modalRoomId; // save before closeSlotModal clears it
   closeSlotModal();
+  markRoomDirty(savedRoomId - 1);
   persist();
   await pushRoom(savedRoomId - 1);
   renderDashboard();
@@ -1683,6 +1686,7 @@ async function editSlotCode(roomId, slotIdx) {
   slot.activatedBy = null;
   slot.attempts    = 0;
   slot.lockedUntil = null;
+  markRoomDirty(roomId - 1);
   persist();
   const p = getActiveProfile(); // pinned once — same db for both calls below
   await pushRoom(roomId - 1, p);
@@ -2378,21 +2382,19 @@ async function checkDailySlotRefresh(p) {
 //      slot arrays with Firebase's copy, so this device ends up matching it.
 // Pull runs even if the push partially failed, so the device still converges
 // to whatever Firebase actually holds.
-// opts.silent   — suppress toasts/nudges (used by the on-load auto-sync).
-// opts.pushFirst — when true, PUSH local changes up first, then pull. When
-//   false, PULL-ONLY (Firebase is authoritative, local is replaced).
+// opts.silent — suppress toasts/nudges (used by the on-load auto-sync).
 //
-// The manual Sync button uses pushFirst=true (upload my edits, then
-// reconcile). The on-load/refresh sync uses pushFirst=FALSE — critical for
-// multi-device: on a fresh page load there are no in-session edits to
-// upload (edits already auto-push the moment they're made), so pushing the
-// stale cached copy would re-upload slots another device just deleted and
-// resurrect them. Pull-only on load takes Firebase as truth, so deletions
-// made elsewhere stick.
+// Sync = "push only uncommitted local changes, then pull ALL data for the
+// active profile and replace local." Both the manual button and the on-load
+// auto-sync use this same behavior:
+//   1. PUSH only rooms flagged _dirty (an edit whose immediate push hasn't
+//      confirmed — e.g. made while offline). Rooms this device merely has a
+//      stale cached copy of are NOT pushed, so a change another device made
+//      (like a deleted slot) is never resurrected by a blind re-upload.
+//   2. PULL /rooms and replace local — Firebase is authoritative.
 async function manualSyncFromFirebase(opts) {
   opts = opts || {};
-  const silent    = !!opts.silent;
-  const pushFirst = opts.pushFirst !== false; // default true (manual button)
+  const silent = !!opts.silent;
   const p = getActiveProfile();
   if (!p || !p.dbUrl) { if (!silent) showToast('Set a Firebase URL in Settings first'); return; }
   const btn   = document.getElementById('syncBtn');
@@ -2402,17 +2404,24 @@ async function manualSyncFromFirebase(opts) {
   if (label) label.textContent = 'Syncing…';
 
   try {
-    // ── 1. PUSH local changes for this profile up to Firebase (manual only) ──
-    // Pinned profile reference so every write in the loop targets the same
-    // database even if the user switches profiles mid-sync.
+    // ── 1. PUSH only rooms with uncommitted local changes ──
+    // NOT a blind push of the whole profile — that would re-upload stale
+    // rooms this device never touched and resurrect changes another device
+    // made (e.g. a slot it deleted). Only rooms flagged _dirty (an edit whose
+    // immediate push hasn't confirmed) are pushed; pushRoom() clears the flag
+    // on success. Pinned profile so every write targets the same database
+    // even across a mid-sync profile switch.
     let pushOk = true;
-    if (pushFirst) {
-      try {
-        pushOk = await pushAllRooms(p);
-      } catch (e) {
-        pushOk = false;
-        addLog('error', 'Sync push failed: ' + e.message);
+    try {
+      for (let i = 0; i < state.rooms.length; i++) {
+        if (state.rooms[i]._dirty) {
+          const ok = await pushRoom(i, p);
+          if (!ok) pushOk = false;
+        }
       }
+    } catch (e) {
+      pushOk = false;
+      addLog('error', 'Sync push failed: ' + e.message);
     }
 
     // ── 2. PULL authoritative copy back and replace local ──
@@ -2436,7 +2445,7 @@ async function manualSyncFromFirebase(opts) {
     persist();
     renderDashboard(); // timeline re-renders on its own when that tab is opened (showPage)
     setConnStatus(true);
-    addLog('ok', (silent ? 'Auto' : 'Manual') + ' sync — ' + (pushFirst ? 'pushed local, replaced with Firebase' : 'pulled Firebase (pull-only)'));
+    addLog('ok', (silent ? 'Auto' : 'Manual') + ' sync — pushed dirty rooms, replaced local with Firebase');
     if (!silent) showToast(pushOk
       ? `✓ Synced ${updated} room${updated === 1 ? '' : 's'} with Firebase`
       : `✓ Synced from Firebase (some local changes may not have uploaded — check connection)`);
@@ -2474,6 +2483,17 @@ function startPolling() {
 // operation (see the note above fbUrl()), so a profile switch mid-flight
 // can't make different calls within this one push land on different
 // databases. Falls back to getActiveProfile() for simple one-off calls.
+// Marks a room as having local changes not yet confirmed in Firebase. Set at
+// every structural mutation site (add/edit/delete slot, recurring, override,
+// copy target, name/pin edits) right before its immediate pushRoom(). A
+// successful pushRoom() clears it; a failed one (offline) leaves it set so
+// the next Sync re-pushes ONLY the rooms that still have uncommitted changes —
+// never a blind push of the whole profile.
+function markRoomDirty(idx) {
+  const r = state.rooms[idx];
+  if (r) { r._dirty = true; }
+}
+
 async function pushRoom(idx, profile) {
   const p = profile || getActiveProfile();
   const r = state.rooms[idx];
@@ -2488,15 +2508,18 @@ async function pushRoom(idx, profile) {
   // Firebase PATCH on parent node replaces ALL children including activatedAt
   // So we write slots individually via targeted PATCH to preserve activatedAt
   const roomBase = `/rooms/room${r.id}`;
+  let ok = true; // AND of every Firebase write below — _dirty is only cleared
+                 // when the whole room pushed successfully, so a failed
+                 // (e.g. offline) write leaves it queued for the next Sync.
 
   // Write room-level fields first
-  await fbPatch(roomBase, {
+  ok = await fbPatch(roomBase, {
     override: r.override,
     name: r.name,
     relayPin: r.relayPin,
     ledPin: r.ledPin,
     updatedAt: Date.now()
-  }, p);
+  }, p) && ok;
 
   // Write each today slot individually — only structural fields, not activation
   const todaySlots = normalizeSlots(r.slots[0]);
@@ -2543,7 +2566,7 @@ async function pushRoom(idx, profile) {
                  // before the next push would resurrect it and reset
                  // activation state again on some later, unrelated save
     }
-    await fbPatch(`${roomBase}/slots/${si}`, patch, p);
+    ok = await fbPatch(`${roomBase}/slots/${si}`, patch, p) && ok;
   }
 
   // Prune ghost slot entries left behind when the array shrinks (e.g.
@@ -2562,7 +2585,7 @@ async function pushRoom(idx, profile) {
     for (const key of Object.keys(existingSlots)) {
       const ghostIdx = parseInt(key, 10);
       if (!isNaN(ghostIdx) && ghostIdx >= todaySlots.length) {
-        await fbSet(`${roomBase}/slots/${ghostIdx}`, null, p);
+        ok = await fbSet(`${roomBase}/slots/${ghostIdx}`, null, p) && ok;
       }
     }
   }
@@ -2572,9 +2595,13 @@ async function pushRoom(idx, profile) {
   const slotsT = tomorrowSlots.map(sl => ({
     s: sl.s, e: sl.e, recurring: sl.recurring, code: sl.code, date: sl.date, expired: false
   }));
-  await fbPatch(roomBase, { slotsT }, p);
+  ok = await fbPatch(roomBase, { slotsT }, p) && ok;
 
-  const ok = true;
+  // Clear the dirty marker only on a fully-successful push — otherwise leave
+  // it set so the next Sync retries this room. Persist so the flag survives
+  // a reload (an edit made offline stays "uncommitted" until it uploads).
+  if (ok && r._dirty) { delete r._dirty; persist(); }
+
   addLog(ok ? 'ok' : 'error', `room${r.id} → Firebase`);
   setConnStatus(ok);
   return ok;
@@ -2768,6 +2795,7 @@ async function deleteSlot(id, idx) {
   if (!requireLicense('delete a slot')) return;
   const r = state.rooms.find(x => x.id === id);
   r.slots[state.schedDay].splice(idx, 1);
+  markRoomDirty(id-1);
   persist(); await pushRoom(id-1); renderDashboard();
 }
 
@@ -2814,6 +2842,7 @@ async function applyRecurring(id) {
       }
     }
   });
+  markRoomDirty(id-1);
   persist(); await pushRoom(id-1); renderDashboard();
   showToast(anyOverlap ? '⚠️ Overlap detected' : '✓ Recurring applied');
 }
@@ -2822,6 +2851,7 @@ async function setOverride(id, val) {
   const r = state.rooms.find(x => x.id === id);
   r.override = val;
   overrideWriteTime[id - 1] = Date.now();
+  markRoomDirty(id - 1);
   persist(); renderDashboard();
   await pushRoom(id - 1);
   // Re-stamp after push — network took some time
@@ -2965,6 +2995,7 @@ async function copySlots(fromId) {
   for (const toId of copyState.selectedRooms) {
     if (toId === fromId) continue;
     const toRoom = state.rooms.find(r => r.id === toId);
+    markRoomDirty(toId - 1); // cleared by a later successful pushRoom/Sync if the direct writes below fail
 
     // Copy today + recurring slots → day 0
     // Each copied slot gets a FRESH unique code + reset activation state.
@@ -3979,10 +4010,9 @@ function bootApp() {
   if (getActiveProfile().dbUrl) {
     startFbListener();
     checkDailySlotRefresh(getActiveProfile()); // once per profile per day — see function comment
-    manualSyncFromFirebase({ silent: true, pushFirst: false }); // on page load: PULL-ONLY.
-      // No in-session edits exist yet (edits auto-push when made), so pushing the
-      // stale cached copy would resurrect slots another device just deleted. Taking
-      // Firebase as truth here makes cross-device deletions stick on refresh.
+    manualSyncFromFirebase({ silent: true }); // on load: push any uncommitted (dirty) rooms,
+      // then pull all Firebase data for the active profile. Stale (non-dirty) rooms are
+      // never re-uploaded, so deletions made on another device stick on refresh.
   }
   renderDashboard();
 
