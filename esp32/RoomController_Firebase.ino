@@ -91,6 +91,20 @@ const int PIN_NONE = -1;  // sentinel: not configured
 // NC wiring means it's ON by default even if the ESP32 itself loses power.
 int emergencyPin = PIN_NONE;
 
+// ── End-of-slot warning — shared beeper + per-room LED blink ──
+// A single controller-wide beeper (not per-room) sounds a short burst when
+// any room's ACTIVE slot enters its final warnMinutes, and that room's own
+// LED (the existing ledPin — no new per-room pin) blinks for the rest of the
+// window. Both settings are read from /config at boot and default to OFF, so
+// existing deployments that never set them behave exactly as before:
+//   /config/beeperPin  → PIN_NONE if unset  → beeper never driven
+//   /config/warnMinutes → <=0 if unset      → whole feature disabled
+// The beeper is driven with plain digitalWrite (active buzzer), same as LEDs.
+int beeperPin   = PIN_NONE;
+int warnMinutes = 0;   // 0 or negative = feature disabled
+#define BEEPER_ON  HIGH
+#define BEEPER_OFF LOW
+
 String firebaseUrl;  // e.g. https://your-project-default-rtdb.asia-southeast1.firebasedatabase.app
 
 // Profiles sharing one Firebase project are namespaced under /profiles/{n} —
@@ -110,6 +124,13 @@ struct Room {
   Slot slots[10];
   int  slotCount = 0;
   char name[24];
+  // End-of-slot warning state (see beeperPin/warnMinutes above). warning is
+  // true only while this room is inside an active slot's final warnMinutes;
+  // while true, the blink logic in loop() owns this room's LED instead of
+  // setRelay(). ledBlinkOn tracks the current blink phase so the toggle is
+  // non-blocking. Both stay false/unused when the feature is disabled.
+  bool warning    = false;
+  bool ledBlinkOn = false;
 };
 
 Room rooms[MAX_ROOMS];
@@ -136,6 +157,19 @@ const unsigned long POLL_INTERVAL     = 5000;   // override poll every 5 sec
 const unsigned long SCHEDULE_INTERVAL = 10000;  // schedule check every 10 sec
 const unsigned long SLOT_REFRESH      = 10000;  // slot refresh every 10 sec — picks up activation fast
 const unsigned long HEARTBEAT         = 300000; // heartbeat every 5 min
+
+// ── End-of-slot warning timing (non-blocking) ────────────────
+const unsigned long LED_BLINK_INTERVAL = 400;  // LED toggle period during a warning window
+const unsigned long BEEP_ON_MS         = 150;  // each beep's on-time within the attention burst
+const unsigned long BEEP_GAP_MS        = 150;  // silence between beeps in the burst
+const int           BEEP_BURST_COUNT   = 1;    // single beep at window start — one-shot, never continuous
+unsigned long lastLedBlinkToggle = 0;
+// One-shot beeper burst, driven non-blocking from loop() so it never stalls
+// polling. beepsRemaining>0 means a burst is in progress; beepPhaseUntil is
+// the millis() deadline for the current on/off phase.
+int           beepsRemaining = 0;
+bool          beepOnPhase    = false;
+unsigned long beepPhaseUntil = 0;
 
 // ── Time helpers ──────────────────────────────────────────────
 int nowH()    { struct tm t; getLocalTime(&t); return t.tm_hour; }
@@ -186,7 +220,11 @@ void setRelay(int idx, bool on) {
   if (rooms[idx].relayPin >= 0) {
     digitalWrite(rooms[idx].relayPin, on ? RELAY_ON : RELAY_OFF);
   }
-  if (rooms[idx].ledPin >= 0) {
+  // While a room is in its end-of-slot warning window, the blink logic in
+  // loop() owns its LED — don't fight it here. The relay still switches
+  // normally; only the LED is deferred. When the warning ends,
+  // checkEndOfSlotWarnings() restores the LED to the current relay state.
+  if (rooms[idx].ledPin >= 0 && !rooms[idx].warning) {
     digitalWrite(rooms[idx].ledPin, on ? LED_ON : LED_OFF);
   }
   if (rooms[idx].lightOn != on) {
@@ -416,6 +454,36 @@ void applyEmergencyPinConfig() {
   } else {
     emergencyPin = val.toInt();
     Serial.printf("Emergency light: GPIO %d\n", emergencyPin);
+  }
+}
+
+// ── Shared end-of-slot warning beeper pin — read once at boot ─────────
+// Same bare-scalar /config read as applyEmergencyPinConfig(). Missing/null/
+// error → PIN_NONE, so no beeper is ever driven (backward-compatible off).
+void applyBeeperPinConfig() {
+  String val = fbGet("/config/beeperPin");
+  if (val == "" || val == "null" || val == "error") {
+    beeperPin = PIN_NONE;
+    Serial.println("End-of-slot beeper: not configured");
+  } else {
+    beeperPin = val.toInt();
+    Serial.printf("End-of-slot beeper: GPIO %d\n", beeperPin);
+  }
+}
+
+// ── Warn-minutes-before-slot-end — read once at boot ─────────────────
+// Missing/null/error → toInt() gives 0 → treated as disabled. A negative or
+// zero value also disables, so the feature stays fully off for any
+// deployment that hasn't explicitly opted in with a positive number.
+void applyWarnMinutesConfig() {
+  String val = fbGet("/config/warnMinutes");
+  int m = val.toInt();
+  if (val == "" || val == "null" || val == "error" || m <= 0) {
+    warnMinutes = 0;
+    Serial.println("End-of-slot warning: disabled");
+  } else {
+    warnMinutes = m;
+    Serial.printf("End-of-slot warning: %d min before end\n", warnMinutes);
   }
 }
 
@@ -712,6 +780,13 @@ bool midnightRollover() {
   }
 
   readAllRooms();
+  // Clear any stale end-of-slot warning state carried across the rollover —
+  // yesterday's slots are gone, so no LED should still be blinking. Silence
+  // the shared beeper burst too. applyAllStates() below then re-drives every
+  // LED from the fresh relay state. All no-ops when the feature is disabled.
+  for (int i = 0; i < roomCount; i++) { rooms[i].warning = false; rooms[i].ledBlinkOn = false; }
+  beepsRemaining = 0;
+  if (beeperPin >= 0) digitalWrite(beeperPin, BEEPER_OFF);
   applyAllStates();
 
   // Record that today's transition is now handled — this is what lets
@@ -809,6 +884,95 @@ void markSlotExpired(int roomIdx, int slotIdx) {
     fbPut(path, newSlotsJson);
     Serial.printf("Room %d slot %s-%s marked expired\n",
       roomIdx+1, startBuf, endBuf);
+  }
+}
+
+// ── End-of-slot warning ──────────────────────────────────────
+// True if the room is currently inside an ACTIVATED slot's final
+// warnMinutes, i.e. now ∈ [slotEnd - warnMinutes, slotEnd). Only activated
+// slots count — there's no point warning about a slot nobody turned on.
+// Always false when the feature is disabled (warnMinutes <= 0), so callers
+// need no extra guard.
+bool inWarningWindow(int idx) {
+  if (warnMinutes <= 0) return false;
+  int nm = nowMins();
+  for (int j = 0; j < rooms[idx].slotCount; j++) {
+    if (!rooms[idx].slots[j].activated) continue;
+    int e = rooms[idx].slots[j].eh * 60 + rooms[idx].slots[j].em;
+    if (nm >= e - warnMinutes && nm < e) return true;
+  }
+  return false;
+}
+
+// Kick off the one-shot attention burst on the shared beeper. Non-blocking:
+// the actual on/off toggling happens in serviceBeeper() from loop(). No-op
+// if no beeper pin is configured.
+void startBeepBurst() {
+  if (beeperPin < 0) return;
+  beepsRemaining = BEEP_BURST_COUNT;
+  beepOnPhase    = true;
+  beepPhaseUntil = millis() + BEEP_ON_MS;
+  digitalWrite(beeperPin, BEEPER_ON);
+}
+
+// Advances the non-blocking beep burst one phase at a time. Called every
+// loop() iteration; cheap no-op when nothing is beeping or no pin is set.
+void serviceBeeper() {
+  if (beeperPin < 0 || beepsRemaining <= 0) return;
+  if (millis() < beepPhaseUntil) return;
+  if (beepOnPhase) {
+    // End this beep's on-phase → go silent for the gap
+    digitalWrite(beeperPin, BEEPER_OFF);
+    beepsRemaining--;
+    beepOnPhase    = false;
+    beepPhaseUntil = millis() + BEEP_GAP_MS;
+  } else if (beepsRemaining > 0) {
+    // Gap over → start the next beep
+    digitalWrite(beeperPin, BEEPER_ON);
+    beepOnPhase    = true;
+    beepPhaseUntil = millis() + BEEP_ON_MS;
+  }
+}
+
+// Toggles the LED of every room currently in its warning window, so it
+// blinks for the duration. Rooms not warning are left untouched — their LED
+// stays owned by setRelay(). Non-blocking: one shared toggle timer for all
+// warning LEDs. No-op when the feature is disabled.
+void serviceWarningLeds() {
+  if (warnMinutes <= 0) return;
+  if (millis() - lastLedBlinkToggle < LED_BLINK_INTERVAL) return;
+  lastLedBlinkToggle = millis();
+  bool anyWarning = false;
+  for (int i = 0; i < roomCount; i++) {
+    if (!rooms[i].warning || rooms[i].ledPin < 0) continue;
+    anyWarning = true;
+    rooms[i].ledBlinkOn = !rooms[i].ledBlinkOn;
+    digitalWrite(rooms[i].ledPin, rooms[i].ledBlinkOn ? LED_ON : LED_OFF);
+  }
+  (void)anyWarning;
+}
+
+// Recomputes each room's warning flag from the clock + activated slots, and
+// fires the shared beeper burst once on the rising edge (window just
+// entered). On the falling edge (window ended / slot over) it restores the
+// LED to its relay-driven steady state so setRelay() owns it again. Entirely
+// skipped when the feature is disabled.
+void checkEndOfSlotWarnings() {
+  if (warnMinutes <= 0) return;
+  for (int i = 0; i < roomCount; i++) {
+    bool nowWarning = (rooms[i].ovr == -1) && inWarningWindow(i);
+    if (nowWarning && !rooms[i].warning) {
+      // Rising edge — enter warning: one attention burst, LED starts blinking.
+      rooms[i].warning    = true;
+      rooms[i].ledBlinkOn = false;
+      startBeepBurst();
+      Serial.printf("[%s] Room %d entering end-of-slot warning\n", getTime().c_str(), i + 1);
+    } else if (!nowWarning && rooms[i].warning) {
+      // Falling edge — leave warning: hand the LED back to relay state.
+      rooms[i].warning = false;
+      if (rooms[i].ledPin >= 0)
+        digitalWrite(rooms[i].ledPin, rooms[i].lightOn ? LED_ON : LED_OFF);
+    }
   }
 }
 
@@ -1023,6 +1187,8 @@ void setup() {
   readAllRooms(); // fills pins/names/overrides/slots for rooms[0..roomCount-1]
   applyRelayWiringConfig();  // must run before pin init below, so RELAY_OFF is already correct
   applyEmergencyPinConfig(); // same — emergencyPin must be known before pinMode() below
+  applyBeeperPinConfig();    // shared end-of-slot beeper pin (off/PIN_NONE if unconfigured)
+  applyWarnMinutesConfig();  // warn window in minutes (0 = feature disabled)
 
   // Configure pins now that we know which GPIOs each room actually uses
   for (int i = 0; i < roomCount; i++) {
@@ -1042,6 +1208,12 @@ void setup() {
   if (emergencyPin >= 0) {
     pinMode(emergencyPin, OUTPUT);
     digitalWrite(emergencyPin, RELAY_OFF); // start OFF — corrected below once real room states are known
+  }
+  // Shared end-of-slot beeper — only touch the pin if it's actually
+  // configured, so unconfigured deployments never drive a random GPIO.
+  if (beeperPin >= 0) {
+    pinMode(beeperPin, OUTPUT);
+    digitalWrite(beeperPin, BEEPER_OFF); // silent at boot
   }
 
   ledStartupTest();
@@ -1094,8 +1266,14 @@ void loop() {
   if (millis() - lastScheduleCheck > SCHEDULE_INTERVAL) {
     lastScheduleCheck = millis();
     checkSchedules();
+    checkEndOfSlotWarnings(); // update per-room warning flags, fire beeper burst on entry
     checkMidnight();  // detect date change → rollover slots
   }
+
+  // Non-blocking end-of-slot warning outputs — run every iteration so the
+  // beep burst and LED blink are smooth. Both no-op when disabled/unconfigured.
+  serviceBeeper();
+  serviceWarningLeds();
 
   // Refresh slots only — no relay state change unless slots count changes
   if (millis() - lastSlotRefresh > SLOT_REFRESH) {
