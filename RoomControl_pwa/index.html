@@ -2530,6 +2530,13 @@ async function pushRoom(idx, profile) {
       recurring: sl.recurring,
       code: sl.code,
       date: sl.date,
+      // Booker name/phone — must be written so activate.html can show the
+      // booked-under name against each slot and the WhatsApp reminder works.
+      // Omitting them (as this patch used to) left bookedBy undefined in
+      // Firebase, so the activation page never displayed it. null clears the
+      // field for a slot with no booker rather than leaving a stale value.
+      bookedBy: sl.bookedBy || null,
+      phone: sl.phone || null,
       // expired IS explicitly reset here (unlike activatedAt/attempts/
       // lockedUntil, which stay ESP32/activate.html-owned) — PATCH only
       // touches fields it's given, so without this a slot that reuses a
