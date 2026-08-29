@@ -349,7 +349,7 @@
       <div id="headerProfileArea"></div>
     </div>
     <div class="header-right">
-      <button class="sync-btn" id="syncBtn" onclick="manualSyncFromFirebase()" title="Pull the latest slots from Firebase (use if a slot added on another device isn't showing)"><span class="sync-ico" id="syncIco">↻</span> <span id="syncLabel">Sync</span></button>
+      <button class="sync-btn" id="syncBtn" onclick="manualSyncFromFirebase()" title="Push this profile's local changes to Firebase, then replace the local copy with Firebase's latest"><span class="sync-ico" id="syncIco">↻</span> <span id="syncLabel">Sync</span></button>
       <div class="live-dot" id="liveDot"></div>
       <span class="conn-label" id="connLabel">Connecting…</span>
       <span class="clock" id="headerClock"></span>
@@ -2369,9 +2369,18 @@ async function checkDailySlotRefresh(p) {
 // whatever Firebase currently holds. Pull-only — never pushes — so it can't
 // clobber a newer remote edit with an older local one; edits made here were
 // already pushed to Firebase when they were saved.
+// Push-then-pull sync, scoped to the ACTIVE PROFILE:
+//   1. PUSH — write this profile's local rooms/slots to Firebase first, so
+//      any local change not yet committed lands there (pushRoom uses PATCH
+//      per-slot and never touches ESP32/activate.html-owned activation
+//      fields, so this can't clobber a live activation).
+//   2. PULL & REPLACE — read /rooms back and replace the local today/tomorrow
+//      slot arrays with Firebase's copy, so this device ends up matching it.
+// Pull runs even if the push partially failed, so the device still converges
+// to whatever Firebase actually holds.
 // silent=true suppresses toasts and the "Set a Firebase URL" nudge — used
-// for the automatic sync on page load (see bootApp()), where those would be
-// noise. The button spinner/disabled handling still runs either way.
+// for the automatic sync on page load (see bootApp()). The button spinner/
+// disabled handling still runs either way.
 async function manualSyncFromFirebase(silent) {
   const p = getActiveProfile();
   if (!p || !p.dbUrl) { if (!silent) showToast('Set a Firebase URL in Settings first'); return; }
@@ -2382,6 +2391,18 @@ async function manualSyncFromFirebase(silent) {
   if (label) label.textContent = 'Syncing…';
 
   try {
+    // ── 1. PUSH local changes for this profile up to Firebase ──
+    // Pinned profile reference so every write in the loop targets the same
+    // database even if the user switches profiles mid-sync.
+    let pushOk = true;
+    try {
+      pushOk = await pushAllRooms(p);
+    } catch (e) {
+      pushOk = false;
+      addLog('error', 'Sync push failed: ' + e.message);
+    }
+
+    // ── 2. PULL authoritative copy back and replace local ──
     const data = await fbGet('/rooms', p);
     if (!data || typeof data !== 'object') {
       if (!silent) showToast('⚠️ Could not read from Firebase — check connection');
@@ -2393,8 +2414,8 @@ async function manualSyncFromFirebase(silent) {
       const idx = parseInt(key.replace('room', ''), 10) - 1;
       if (idx < 0 || idx >= state.rooms.length) return;
       const remote = data[key] || {};
-      // Firebase is authoritative for slot structure AND activation state on
-      // an explicit sync — replace both today and tomorrow wholesale.
+      // Firebase is authoritative for slot structure AND activation state
+      // after the push — replace both today and tomorrow wholesale.
       state.rooms[idx].slots[0] = normalizeSlots(remote.slots);
       state.rooms[idx].slots[1] = normalizeSlots(remote.slotsT);
       updated++;
@@ -2402,8 +2423,10 @@ async function manualSyncFromFirebase(silent) {
     persist();
     renderDashboard(); // timeline re-renders on its own when that tab is opened (showPage)
     setConnStatus(true);
-    addLog('ok', (silent ? 'Auto' : 'Manual') + ' sync — slots pulled from Firebase');
-    if (!silent) showToast(`✓ Synced ${updated} room${updated === 1 ? '' : 's'} from Firebase`);
+    addLog('ok', (silent ? 'Auto' : 'Manual') + ' sync — pushed local, replaced with Firebase');
+    if (!silent) showToast(pushOk
+      ? `✓ Synced ${updated} room${updated === 1 ? '' : 's'} with Firebase`
+      : `✓ Synced from Firebase (some local changes may not have uploaded — check connection)`);
   } catch (e) {
     addLog('error', 'Sync failed: ' + e.message);
     if (!silent) showToast('⚠️ Sync failed — check connection');
