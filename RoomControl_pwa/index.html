@@ -652,6 +652,19 @@ function makeBlankRooms() {
   }));
 }
 const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+// Compact label for a recurring slot's weekday set. Collapses a fully
+// contiguous run to a range ("Mon–Fri"), otherwise lists them ("Mon, Wed, Fri").
+// Empty/all-7 → "daily" (caller usually won't show it in that case).
+function formatDaySet(days) {
+  if (!Array.isArray(days) || days.length === 0 || days.length === 7) return 'daily';
+  const sorted = [...new Set(days)].filter(d => d >= 0 && d <= 6).sort((a,b) => a-b);
+  if (sorted.length === 0) return 'daily';
+  let contiguous = true;
+  for (let i = 1; i < sorted.length; i++) if (sorted[i] !== sorted[i-1] + 1) { contiguous = false; break; }
+  if (contiguous && sorted.length >= 3) return DAYS[sorted[0]] + '–' + DAYS[sorted[sorted.length-1]];
+  return sorted.map(d => DAYS[d]).join(', ');
+}
 let fbConnected = false;
 let fbListener = null;
 let tlView = '12h';
@@ -1245,7 +1258,7 @@ function openRecurringModal(roomId) {
   if (!requireLicense('edit a recurring schedule')) return;
   recModalRoomId = roomId;
   const r = state.rooms.find(x => x.id === roomId);
-  document.getElementById('recModalTitle').textContent = 'Recurring — ' + r.name;
+  document.getElementById('recModalTitle').textContent = 'Create Recurring Slot — ' + r.name;
   document.getElementById('rec_start').value = r.recurring.start || '09:00';
   document.getElementById('rec_end').value   = r.recurring.end   || '10:00';
   // Build day pills
@@ -2537,6 +2550,10 @@ async function pushRoom(idx, profile) {
       // field for a slot with no booker rather than leaving a stale value.
       bookedBy: sl.bookedBy || null,
       phone: sl.phone || null,
+      // Per-slot recurring weekday set (0=Sun..6=Sat) — written so the day-of-
+      // week recurrence persists and reaches the ESP32. null for non-recurring
+      // slots or recurring slots with no restriction (runs every day).
+      days: (sl.recurring && Array.isArray(sl.days) && sl.days.length) ? sl.days : null,
       // expired IS explicitly reset here (unlike activatedAt/attempts/
       // lockedUntil, which stay ESP32/activate.html-owned) — PATCH only
       // touches fields it's given, so without this a slot that reuses a
@@ -2597,10 +2614,13 @@ async function pushRoom(idx, profile) {
     }
   }
 
-  // Write slotsT (tomorrow) — these are never activated so safe to write fully
+  // Write slotsT (tomorrow) — these are never activated so safe to write fully.
+  // days IS included now so a recurring slot seeded into tomorrow keeps its
+  // weekday set (needed for the ESP32 and for the Tomorrow view's day gate).
   const tomorrowSlots = normalizeSlots(r.slots[1]);
   const slotsT = tomorrowSlots.map(sl => ({
-    s: sl.s, e: sl.e, recurring: sl.recurring, code: sl.code, date: sl.date, expired: false
+    s: sl.s, e: sl.e, recurring: sl.recurring, code: sl.code, date: sl.date, expired: false,
+    days: (sl.recurring && Array.isArray(sl.days) && sl.days.length) ? sl.days : null
   }));
   ok = await fbPatch(roomBase, { slotsT }, p) && ok;
 
@@ -2621,26 +2641,70 @@ async function pushRoom(idx, profile) {
 // outage, a stale lastRolloverEpochDay marker surviving a firmware
 // update, etc.) and stale one-time slots need clearing before the next
 // real midnight — runs entirely from here, no ESP32 involvement needed.
+// True if a recurring slot should run on the given weekday (0=Sun..6=Sat).
+// A slot with no days list (or an empty one) runs EVERY day — preserves the
+// pre-V1 "recurring = daily" behavior for slots created before this feature.
+// Recurring slots are NEVER dropped from the bucket on off days (that would
+// lose them permanently); instead this gate is consulted wherever we decide
+// whether the slot is "live today" — schedule/relay evaluation and display.
+function recurringRunsOnDay(sl, weekday) {
+  if (!Array.isArray(sl.days) || sl.days.length === 0) return true;
+  return sl.days.includes(weekday);
+}
+function recurringRunsToday(sl) { return recurringRunsOnDay(sl, new Date().getDay()); }
+
+// Tomorrow's local date string (YYYY-MM-DD), used when seeding the tomorrow
+// bucket during rollover.
+function tomorrowDateStr() {
+  const dt = new Date(); dt.setDate(dt.getDate()+1);
+  return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');
+}
+
 function rolloverRoomLocally(r) {
   const todaySlots    = normalizeSlots(r.slots[0]);
-  const tomorrowSlots  = normalizeSlots(r.slots[1]);
+  const tomorrowSlots = normalizeSlots(r.slots[1]);
   const resetFields = { activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false, _fresh: true };
   const todayDateStr = todayStr();
+  const tomorrowDate = tomorrowDateStr();
+  const newTodayWd    = new Date().getDay();   // rollover runs on the new day
+  const newTomorrowWd = (newTodayWd + 1) % 7;
 
-  const keptRecurring = todaySlots.filter(sl => sl.recurring).map(sl => ({ ...sl, ...resetFields }));
-  // A one-time slot in today's bucket whose own date is still actually
-  // today was created after an earlier rollover ran today (or just now)
-  // — not stale, so it's kept exactly as-is (no reset: it isn't
-  // transitioning from anywhere, so any activation it already has must
-  // survive). Only a date that ISN'T today marks a genuine leftover from
-  // a previous day, dropped same as before. A missing date field (an
-  // older slot from before this field existed) can't be told apart from
-  // stale, so it's dropped too — same as the original behavior.
+  // ── Recurring definitions ──────────────────────────────────
+  // The set of distinct recurring slots (by start/end/days) currently held in
+  // either bucket IS the source of truth for regeneration. Dedup so a def that
+  // exists in both today and tomorrow is only regenerated once.
+  const sameDays = arr => JSON.stringify((arr || []).slice().sort());
+  const defKey = sl => sl.s + '|' + sl.e + '|' + sameDays(sl.days);
+  const recurringDefs = [];
+  const seen = new Set();
+  [...todaySlots, ...tomorrowSlots].forEach(sl => {
+    if (!sl.recurring) return;
+    const k = defKey(sl);
+    if (seen.has(k)) return;
+    seen.add(k);
+    recurringDefs.push(sl);
+  });
+
+  // ── Build new TODAY ────────────────────────────────────────
+  // 1. Promote only NON-recurring slots from tomorrow (reset activation, date→today).
+  const promoted = tomorrowSlots
+    .filter(sl => !sl.recurring)
+    .map(sl => ({ ...sl, ...resetFields, date: todayDateStr }));
+  // 2. Keep today's own one-time slots that are genuinely still today
+  //    (created after an earlier rollover today) — untouched, activation kept.
   const keptOneTimeToday = todaySlots.filter(sl => !sl.recurring && sl.date === todayDateStr);
-  const promoted = tomorrowSlots.filter(sl => !sl.recurring).map(sl => ({ ...sl, ...resetFields, date: todayStr() }));
+  // 3. Regenerate every recurring def that runs on the NEW today's weekday.
+  const regenToday = recurringDefs
+    .filter(def => recurringRunsOnDay(def, newTodayWd))
+    .map(def => ({ ...def, ...resetFields, date: todayDateStr }));
 
-  r.slots[0] = [...keptRecurring, ...keptOneTimeToday, ...promoted];
-  r.slots[1] = [];
+  r.slots[0] = [...regenToday, ...keptOneTimeToday, ...promoted];
+
+  // ── Build new TOMORROW ─────────────────────────────────────
+  // Only recurring defs that run on tomorrow's weekday (fresh, activation reset).
+  r.slots[1] = recurringDefs
+    .filter(def => recurringRunsOnDay(def, newTomorrowWd))
+    .map(def => ({ ...def, ...resetFields, date: tomorrowDate }));
 }
 
 // Days since the Unix epoch, counted by LOCAL calendar date — matches
@@ -2728,7 +2792,11 @@ function nowMins()  { const n=new Date(); return n.getHours()*60+n.getMinutes();
 
 function isScheduledNow(room) {
   const nm = nowMins();
-  return (room.slots[0]||[]).some(s => nm >= toMins(s.s) && nm < toMins(s.e));
+  // A recurring slot only counts today if today's weekday is in its days list
+  // (recurringRunsToday); one-time slots and legacy recurring slots (no days)
+  // count as before.
+  return (room.slots[0]||[]).some(s =>
+    nm >= toMins(s.s) && nm < toMins(s.e) && (!s.recurring || recurringRunsToday(s)));
 }
 
 function getLightState(room) {
@@ -2823,35 +2891,52 @@ async function applyRecurring(id) {
   if (!r.recurring.start || !r.recurring.end || r.recurring.start >= r.recurring.end) {
     showToast('⚠️ Invalid time range'); return;
   }
-  const today = new Date().getDay();
-  let anyOverlap = false;
-  [0,1].forEach(day => {
-    const d = (today + day) % 7;
-    if (r.recurring.days.includes(d)) {
-      if (!r.slots[day]) r.slots[day] = [];
-      const exists = r.slots[day].some(sl =>
-        sl.s === r.recurring.start && sl.e === r.recurring.end);
-      if (!exists) {
-        const overlapping = r.slots[day].filter(sl =>
-          slotsOverlap(r.recurring.start, r.recurring.end, sl.s, sl.e));
-        if (overlapping.length > 0) anyOverlap = true;
-        r.slots[day].push({
-          s: r.recurring.start, e: r.recurring.end,
-          recurring: true, code: generate4DigitCode(),
-          activatedAt: null, activatedBy: null,
-          attempts: 0, lockedUntil: null, expired: false,
-          _fresh: true,
-          date: day === 0 ? todayStr() : (() => {
-            const dt = new Date(); dt.setDate(dt.getDate()+1);
-            return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');
-          })()
-        });
-      }
-    }
+  // Materialize the recurring slot into the TODAY and/or TOMORROW buckets,
+  // but only into a bucket whose weekday is one of the selected days. Since
+  // the dashboard shows Today and Tomorrow, this makes the slot appear
+  // immediately on the correct day(s) after creation — a Mon–Fri slot created
+  // on a Sunday lands in tomorrow (Mon) right away, and nothing in Sunday.
+  // Rollover then keeps regenerating it on subsequent matching days.
+  const days = [...r.recurring.days];
+  const sameDays = arr => JSON.stringify((arr || []).slice().sort());
+  const todayWd    = new Date().getDay();
+  const tomorrowWd = (todayWd + 1) % 7;
+
+  const makeSlot = (dateStr) => ({
+    s: r.recurring.start, e: r.recurring.end,
+    recurring: true, code: generate4DigitCode(),
+    days: [...days],
+    activatedAt: null, activatedBy: null,
+    attempts: 0, lockedUntil: null, expired: false,
+    _fresh: true,
+    date: dateStr
   });
+  const tomorrowStrLocal = () => {
+    const dt = new Date(); dt.setDate(dt.getDate()+1);
+    return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');
+  };
+
+  let addedTo = [];
+  let anyOverlap = false;
+  [[0, todayWd, todayStr()], [1, tomorrowWd, tomorrowStrLocal()]].forEach(([bucket, wd, dateStr]) => {
+    if (!days.includes(wd)) return;                 // slot doesn't run that day → don't seed that bucket
+    if (!r.slots[bucket]) r.slots[bucket] = [];
+    const exists = r.slots[bucket].some(sl =>
+      sl.recurring && sl.s === r.recurring.start && sl.e === r.recurring.end &&
+      sameDays(sl.days) === sameDays(days));
+    if (exists) return;                             // already there → skip (dedup)
+    if (r.slots[bucket].some(sl => slotsOverlap(r.recurring.start, r.recurring.end, sl.s, sl.e))) anyOverlap = true;
+    r.slots[bucket].push(makeSlot(dateStr));
+    addedTo.push(bucket === 0 ? 'today' : 'tomorrow');
+  });
+
   markRoomDirty(id-1);
   persist(); await pushRoom(id-1); renderDashboard();
-  showToast(anyOverlap ? '⚠️ Overlap detected' : '✓ Recurring applied');
+  if (addedTo.length === 0) {
+    showToast('✓ Recurring saved — starts on the next ' + formatDaySet(days) + ' day');
+  } else {
+    showToast((anyOverlap ? '⚠️ Recurring saved (overlaps another slot) — ' : '✓ Recurring saved — ') + 'shows ' + addedTo.join(' & '));
+  }
 }
 
 async function setOverride(id, val) {
@@ -3167,7 +3252,20 @@ function renderRoomCard(r) {
   if (r.override === false) { badgeCls = 'room-badge badge-off';  badgeTxt = 'Manual OFF'; }
   if (r.override === null && ls.on) { badgeCls = 'room-badge badge-sched'; badgeTxt = 'Active'; }
 
-  const slots = r.slots[state.schedDay] || [];
+  // Hide recurring slots that don't run on the viewed weekday, so e.g. a
+  // Mon–Fri slot does not appear in Saturday/Sunday's list even though it's
+  // stored for persistence. One-time slots and every-day recurring slots
+  // (no days list) always show.
+  // IMPORTANT: keep each visible slot's ORIGINAL index in r.slots[schedDay]
+  // (as `origIdx`) — the row's action buttons (activate/deactivate/edit/
+  // delete/code) index into the UNFILTERED array, so passing the filtered
+  // position would target the wrong slot (that was the "stays Waiting / no
+  // Deactivate" bug after the day filter was added).
+  const viewedWeekday = state.schedDay === 0 ? new Date().getDay() : (new Date().getDay() + 1) % 7;
+  const slots = (r.slots[state.schedDay] || [])
+    .map((s, origIdx) => ({ s, origIdx }))
+    .filter(({ s }) =>
+      !s.recurring || !Array.isArray(s.days) || s.days.length === 0 || s.days.includes(viewedWeekday));
   let body = '';
 
   if (r.expanded) {
@@ -3179,7 +3277,8 @@ function renderRoomCard(r) {
 
     if (r.panelTab === 'slot') {
       const slotItems = slots.length
-        ? slots.map((s,i) => {
+        ? slots.map(({s, origIdx}) => {
+            const i = origIdx; // original index into r.slots[schedDay] — used by all row actions
             const now = new Date();
             const nm = now.getHours()*60+now.getMinutes();
             const ss = toMinsStr(s.s), se = toMinsStr(s.e);
@@ -3192,7 +3291,13 @@ function renderRoomCard(r) {
             const dotCol   = s.recurring ? 'var(--green)' : 'var(--accent)';
             const badgeBg  = s.recurring ? 'rgba(64,192,128,0.15)' : 'rgba(74,143,255,0.12)';
             const badgeCol = s.recurring ? 'var(--green)' : 'var(--accent)';
-            const badgeTxt = s.recurring ? 'recurring' : 'one-time';
+            // Recurring badge shows its day set (e.g. "Mon–Fri" / "Mon, Wed").
+            // Dormant recurring slots are already filtered out of this list
+            // (see the slots filter above), so any shown here does run today.
+            const hasDayRestriction = s.recurring && Array.isArray(s.days) && s.days.length && s.days.length < 7;
+            const badgeTxt = s.recurring
+              ? ('recurring' + (hasDayRestriction ? ' · ' + formatDaySet(s.days) : ''))
+              : 'one-time';
             return `<div class="slot-item" style="flex-wrap:wrap;gap:5px${isExpired ? ';opacity:0.5' : ''}">
               <div class="slot-dot" style="background:${isActive ? 'var(--green)' : isExpired ? 'var(--muted)' : isWaiting ? 'var(--amber)' : dotCol}"></div>
               <span class="slot-time">${s.s} – ${s.e}</span>
@@ -3218,7 +3323,7 @@ function renderRoomCard(r) {
         </div>
         <div class="slot-list">${slotItems}</div>
         <button class="add-slot-btn" onclick="openSlotModal(${r.id})">+ Add slot</button>
-        <button class="add-slot-btn" style="margin-top:6px;border-color:var(--green);color:var(--green)" onclick="openRecurringModal(${r.id})">⟳ Edit recurring schedule</button>
+        <button class="add-slot-btn" style="margin-top:6px;border-color:var(--green);color:var(--green)" onclick="openRecurringModal(${r.id})">⟳ Create recurring slot</button>
         <button class="add-slot-btn" style="margin-top:6px" onclick="openCopyModal(${r.id})">⧉ Copy slots to other rooms…</button>`;
 
     } else {
@@ -3541,7 +3646,15 @@ async function saveActiveProfile() {
   if (!requireLicense('save profile settings')) return;
   const p = getActiveProfile();
   resetConnectionForProfileChange();
+  const prevDbUrl = p.dbUrl; // capture before overwrite — see fbNum reset below
   p.dbUrl     = document.getElementById('cfg-url').value.trim().replace(/\/$/, '');
+  // If the Database URL changed, the profile's fbNum (its /profiles/{n} slot)
+  // was assigned in the OLD database and is meaningless in the new one.
+  // Clear it so ensureProfileNumber() re-scans the NEW db and registers this
+  // profile there (writing /profiles/{n}/name). Without this, the save reused
+  // the stale number, never created the profile node in the new db, and the
+  // data appeared not to save.
+  if (prevDbUrl !== p.dbUrl) p.fbNum = null;
   p.apiKey    = document.getElementById('cfg-key').value.trim();
   p.adminSeed = document.getElementById('cfg-seed').value.trim() || '1234';
   p.whatsappTemplate = document.getElementById('cfg-whatsapp-template').value.trim() || DEFAULT_WHATSAPP_TEMPLATE;
@@ -4129,7 +4242,7 @@ function applyUpdate() {
           <input class="modal-time" type="time" id="rec_end" value="10:00">
         </div>
         <div class="modal-divider"></div>
-        <button class="modal-save-btn" onclick="saveRecurringFromModal()">Apply to today & tomorrow</button>
+        <button class="modal-save-btn" onclick="saveRecurringFromModal()">Create recurring</button>
         <button class="modal-cancel-btn" onclick="closeRecurringModal()">Cancel</button>
       </div>
     </div>
