@@ -142,6 +142,11 @@
     .seg-btn { flex: 1; padding: 7px 0; border-radius: 8px; border: 1px solid var(--border); background: transparent; font-size: 12px; color: var(--muted); cursor: pointer; }
     .seg-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
     .timeline-wrap { background: var(--card); border-radius: var(--radius); padding: 10px; }
+    /* The timeline is a tappable canvas. Suppress the mobile text/element
+       selection highlight (the blue overlay that flashed over the whole chart
+       on tap) and the tap-highlight flash, so a tap just registers the click. */
+    #tlCanvas { -webkit-user-select: none; -moz-user-select: none; -ms-user-select: none; user-select: none;
+      -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
     .tl-legend { display: flex; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
     .tl-legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
     .tl-legend-dot { width: 10px; height: 10px; border-radius: 2px; }
@@ -1683,6 +1688,7 @@ function openSlotModal(roomId, opts) {
   const r     = state.rooms.find(x => x.id === roomId);
   document.getElementById('modalTitle').textContent = 'Add Slot — ' + r.name;
   document.getElementById('slotModalSaveBtn').textContent = '+ Add Slot';
+  document.getElementById('slotModalDeleteBtn').style.display = 'none'; // no delete when adding
   // Current-hour default (used when no explicit prefill is passed).
   const curHour   = new Date().getHours();
   const defStart  = String(curHour).padStart(2, '0') + ':00';
@@ -1723,6 +1729,7 @@ function openSlotModalEdit(roomId, slotIdx) {
   modalDay    = state.schedDay;
   document.getElementById('modalTitle').textContent = 'Edit Slot — ' + r.name;
   document.getElementById('slotModalSaveBtn').textContent = '✓ Save Changes';
+  document.getElementById('slotModalDeleteBtn').style.display = ''; // delete available when editing
   // Prefill from the existing slot
   document.getElementById('m_start').value    = slot.s || '09:00';
   document.getElementById('m_end').value      = slot.e || '10:00';
@@ -1934,6 +1941,25 @@ async function saveSlotFromModal() {
   refreshTimelineIfVisible();
   const codeMsg = !requireCode ? ' (auto)' : ` (code: ${slotCode})`;
   showToast((recurring ? '✓ Recurring' : '✓ One-time') + ' slot added' + codeMsg);
+}
+
+// Delete the slot currently open in the edit modal. Only reachable in edit mode
+// (the button is hidden when adding). Confirms first, then reuses deleteSlot()
+// which removes it from the current-day bucket and pushes. modalDay was set to
+// the slot's bucket when the modal opened, and deleteSlot indexes by
+// state.schedDay — the edit flow keeps those aligned (dashboard edit uses the
+// current schedDay; a timeline edit set schedDay to the bar's bucket).
+async function deleteSlotFromModal() {
+  if (editingSlotIdx === null || !modalRoomId) return;
+  const r = state.rooms.find(x => x.id === modalRoomId);
+  const slot = r && (r.slots[modalDay] || [])[editingSlotIdx];
+  const label = slot ? `${slot.s} – ${slot.e}` : 'this slot';
+  if (!confirm(`Delete slot ${label}?\n\nThis removes the booking. This cannot be undone.`)) return;
+  const roomId = modalRoomId;
+  const idx    = editingSlotIdx;
+  closeSlotModal();
+  await deleteSlot(roomId, idx);
+  showToast('✓ Slot deleted');
 }
 
 function generate4DigitCode() {
@@ -5013,6 +5039,7 @@ function applyUpdate() {
         <div class="modal-divider"></div>
         <div style="font-size:11px;color:var(--muted);margin-bottom:8px">For repeating bookings, use "⟳ Manage recurring slots" on the room instead.</div>
         <button class="modal-save-btn" id="slotModalSaveBtn" onclick="saveSlotFromModal()">+ Add Slot</button>
+        <button class="modal-cancel-btn" id="slotModalDeleteBtn" onclick="deleteSlotFromModal()" style="display:none;border-color:var(--red);color:var(--red)">🗑 Delete Slot</button>
         <button class="modal-cancel-btn" onclick="closeSlotModal()">Cancel</button>
       </div>
     </div>
