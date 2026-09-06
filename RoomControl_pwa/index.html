@@ -4145,6 +4145,8 @@ async function switchProfile(id) {
   updateHeaderProfile();
   renderDashboard();
   renderSettings();
+  refreshTimelineIfVisible(); // redraw the timeline for the new profile's rooms
+                              // if the Timeline tab is the one currently open
   addLog('ok', `Switched to profile "${p.name}"`);
   showToast(`Switched to ${p.name} — connecting…`);
   controllerLastSeenStr = null; // reset board-health for the new profile
