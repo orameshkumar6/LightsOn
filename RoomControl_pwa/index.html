@@ -1094,9 +1094,18 @@ function sendSlotWhatsAppReminder(roomId, slotIdx) {
   const r = state.rooms.find(x => x.id === roomId);
   const slot = r && r.slots[0] && r.slots[0][slotIdx];
   if (!slot || !slot.phone) { showToast('No phone number saved for this slot'); return; }
+  sendSlotWhatsApp(r, slot);
+}
+
+// Build + open the WhatsApp message for a specific room+slot object (any day
+// bucket). Shared by the reminder button and the payment-confirmation flow so
+// both use the exact same template + wa.me mechanism. Returns true if it
+// opened WhatsApp, false if the phone was missing/invalid.
+function sendSlotWhatsApp(r, slot) {
+  if (!slot || !slot.phone) { showToast('⚠️ No phone number for this slot'); return false; }
   const p = getActiveProfile();
   const digits = buildWhatsAppNumber(slot.phone, p.whatsappCountryCode);
-  if (!digits) { showToast('⚠️ No valid phone number'); return; }
+  if (!digits) { showToast('⚠️ No valid phone number'); return false; }
   const bookingText = fillWhatsAppTemplate(p.whatsappTemplate || DEFAULT_WHATSAPP_TEMPLATE, {
     PROFILE: p.name || '', NAME: slot.bookedBy || '', ROOM: r.name, DATE: slot.date || todayStr(),
     START: slot.s, END: slot.e, CODE: slot.code || ''
@@ -1106,6 +1115,7 @@ function sendSlotWhatsAppReminder(roomId, slotIdx) {
   // up even for templates saved before this existed.
   const text = bookingText + '\n\n' + productInfoLine();
   window.open(`https://wa.me/${digits}?text=${encodeURIComponent(text)}`, '_blank');
+  return true;
 }
 
 // ── Import Booking page ───────────────────────────────────────
@@ -1890,6 +1900,7 @@ async function saveSlotFromModal() {
     }
     const savedRoomId = modalRoomId;
     const savedIdx    = editingSlotIdx;
+    const savedDay    = modalDay; // bucket this slot lives in (for the pay flow below)
     const resetActivation = timeChanged || codeChanged;
     const reseedActivatedAt = slot.activatedAt;   // capture for the direct patch below
     const reseedActivatedBy = slot.activatedBy;
@@ -1912,6 +1923,10 @@ async function saveSlotFromModal() {
     renderDashboard();
     refreshTimelineIfVisible();
     showToast('✓ Slot updated');
+    // If the saved slot is Paid, offer to send a WhatsApp confirmation (same as
+    // the dashboard chip flow). Unpaid saves never prompt. Only for one-time
+    // slots (recurring isn't payment-colour-coded / this modal edits one-time).
+    if (paid && !recurring) maybeSendPaidConfirmation(savedRoomId, savedIdx, savedDay);
     return;
   }
 
@@ -1933,6 +1948,8 @@ async function saveSlotFromModal() {
   });
 
   const savedRoomId = modalRoomId; // save before closeSlotModal clears it
+  const savedIdx    = r.slots[modalDay].length - 1; // index of the just-added slot
+  const savedDay    = modalDay;
   closeSlotModal();
   markRoomDirty(savedRoomId - 1);
   persist();
@@ -1941,6 +1958,9 @@ async function saveSlotFromModal() {
   refreshTimelineIfVisible();
   const codeMsg = !requireCode ? ' (auto)' : ` (code: ${slotCode})`;
   showToast((recurring ? '✓ Recurring' : '✓ One-time') + ' slot added' + codeMsg);
+  // If the new slot was created Paid, offer the WhatsApp confirmation — same as
+  // the edit-save and chip flows. Unpaid never prompts; recurring is excluded.
+  if (paid && !recurring) maybeSendPaidConfirmation(savedRoomId, savedIdx, savedDay);
 }
 
 // Delete the slot currently open in the edit modal. Only reachable in edit mode
@@ -1972,19 +1992,136 @@ function generate4DigitCode() {
 // the activation-field resets in editSlotCode). Recurring instances don't show
 // the chip (payment isn't colour-coded for them), so this only ever runs on
 // one-time slots — but it's harmless if called on one.
+// Toggle a slot's payment status from the dashboard chip.
+//  • paid → unpaid: just flip it, no prompts.
+//  • unpaid → paid: ask whether to send a WhatsApp confirmation.
+//      – Yes: if a phone is on file, mark paid + send; if not, open the small
+//             window to collect Name + Phone, then mark paid + send.
+//      – No/Cancel: still mark the slot paid, just don't send anything.
 async function toggleSlotPaid(roomId, slotIdx) {
   if (!requireLicense('update payment status')) return;
   const r = state.rooms.find(x => x.id === roomId);
   if (!r) return;
   const slot = (r.slots[state.schedDay] || [])[slotIdx];
   if (!slot) { showToast('Slot not found'); return; }
-  slot.paid = !slot.paid;
+
+  if (slot.paid) {
+    // paid → unpaid: silent flip.
+    slot.paid = false;
+    markRoomDirty(roomId - 1);
+    persist();
+    await pushRoom(roomId - 1);
+    renderDashboard();
+    refreshTimelineIfVisible();
+    showToast('Marked as unpaid');
+    return;
+  }
+
+  // unpaid → paid: ask about the WhatsApp confirmation first.
+  const sendConfirm = confirm('Marked as paid.\n\nSend a WhatsApp confirmation to the customer?');
+  if (!sendConfirm) {
+    // Just record the payment, no message.
+    await commitSlotPaid(roomId, slotIdx, { sendConfirmation: false });
+    return;
+  }
+  // They want to send.
+  if (slot.phone) {
+    await commitSlotPaid(roomId, slotIdx, { sendConfirmation: true });
+  } else {
+    // Need contact details first — open the collect window (it sends on submit).
+    openPayModal(roomId, slotIdx);
+  }
+}
+
+// Marks the slot paid, optionally writing booker name/phone first, persists +
+// pushes, and (optionally) fires the WhatsApp confirmation. Centralises the
+// write so both the direct path and the modal path behave identically.
+async function commitSlotPaid(roomId, slotIdx, opts) {
+  opts = opts || {};
+  const r = state.rooms.find(x => x.id === roomId);
+  if (!r) return;
+  const slot = (r.slots[state.schedDay] || [])[slotIdx];
+  if (!slot) { showToast('Slot not found'); return; }
+  if (typeof opts.bookedBy === 'string') slot.bookedBy = opts.bookedBy || null;
+  if (typeof opts.phone === 'string')    slot.phone = opts.phone || null;
+  slot.paid = true;
   markRoomDirty(roomId - 1);
   persist();
   await pushRoom(roomId - 1);
   renderDashboard();
   refreshTimelineIfVisible();
-  showToast(slot.paid ? '✓ Marked as paid' : 'Marked as unpaid');
+  showToast('✓ Marked as paid');
+  if (opts.sendConfirmation) sendSlotWhatsApp(r, slot);
+}
+
+// Shared "offer to send a WhatsApp confirmation for a paid slot" step, used by
+// the edit-slot save. Asks first; on Yes, sends if a phone is on file, else
+// opens the collect window to gather Name + Phone then send. On No, does
+// nothing (the slot is already saved as paid by the caller). `day` is the slot's
+// bucket; we align state.schedDay to it so the collect modal / sender target
+// the right slot.
+function maybeSendPaidConfirmation(roomId, slotIdx, day) {
+  const r = state.rooms.find(x => x.id === roomId);
+  if (!r) return;
+  if (state.schedDay !== day) setSchedDay(day);
+  const slot = (r.slots[day] || [])[slotIdx];
+  if (!slot) return;
+  if (!confirm('This booking is marked Paid.\n\nSend a WhatsApp confirmation to the customer?')) return;
+  if (slot.phone) {
+    sendSlotWhatsApp(r, slot);
+  } else {
+    // No phone yet — collect it, then the modal sends on submit.
+    openPayModal(roomId, slotIdx);
+  }
+}
+
+// ── Payment-details collect modal ─────────────────────────────
+let payModalRoomId = null;
+let payModalSlotIdx = null;
+let payModalDay = 0;
+
+// Opens the small "collect Name + Phone" window shown when marking an
+// unpaid slot as paid that has no phone yet. Prefills any existing name.
+function openPayModal(roomId, slotIdx) {
+  const r = state.rooms.find(x => x.id === roomId);
+  const slot = r && (r.slots[state.schedDay] || [])[slotIdx];
+  if (!slot) { showToast('Slot not found'); return; }
+  payModalRoomId = roomId;
+  payModalSlotIdx = slotIdx;
+  payModalDay = state.schedDay; // capture the bucket now — schedDay could change later
+  document.getElementById('payModalTitle').textContent = `Payment — ${r.name} ${slot.s}–${slot.e}`;
+  document.getElementById('pay_name').value = slot.bookedBy || '';
+  document.getElementById('pay_phone').value = slot.phone || '';
+  document.getElementById('payModal').classList.add('show');
+  setTimeout(() => { const el = document.getElementById('pay_phone'); if (el) el.focus(); }, 50);
+}
+
+function closePayModal() {
+  document.getElementById('payModal').classList.remove('show');
+  payModalRoomId = null;
+  payModalSlotIdx = null;
+}
+
+function payModalBackdropClick(e) {
+  if (e.target.id === 'payModal') closePayModal();
+}
+
+// Submit the collect window: phone is required (needed to send the WhatsApp
+// confirmation); name is optional. On success, save details + mark paid + send.
+async function savePayModal() {
+  if (payModalRoomId === null || payModalSlotIdx === null) return;
+  const name  = document.getElementById('pay_name').value.trim();
+  const phone = document.getElementById('pay_phone').value.trim();
+  if (!phone) { showToast('⚠️ Phone number is required to confirm'); return; }
+  // Validate the phone the same way the WhatsApp sender will.
+  const p = getActiveProfile();
+  if (!buildWhatsAppNumber(phone, p.whatsappCountryCode)) { showToast('⚠️ Enter a valid phone number'); return; }
+  const roomId = payModalRoomId, slotIdx = payModalSlotIdx;
+  // The modal captured the day bucket at open; align schedDay so commitSlotPaid
+  // (which indexes by state.schedDay) targets the same slot.
+  if (state.schedDay !== payModalDay) setSchedDay(payModalDay);
+  closePayModal();
+  await commitSlotPaid(roomId, slotIdx, { bookedBy: name, phone, sendConfirmation: true });
 }
 
 async function editSlotCode(roomId, slotIdx) {
@@ -5043,6 +5180,32 @@ function applyUpdate() {
         <button class="modal-save-btn" id="slotModalSaveBtn" onclick="saveSlotFromModal()">+ Add Slot</button>
         <button class="modal-cancel-btn" id="slotModalDeleteBtn" onclick="deleteSlotFromModal()" style="display:none;border-color:var(--red);color:var(--red)">🗑 Delete Slot</button>
         <button class="modal-cancel-btn" onclick="closeSlotModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Payment details collect modal ────────────────────────── -->
+  <!-- Shown when marking an unpaid slot Paid that has no phone yet: collect
+       Name + Phone, then confirm via WhatsApp and save onto the slot. -->
+  <div class="modal-overlay" id="payModal" onclick="payModalBackdropClick(event)">
+    <div class="modal-box">
+      <div class="modal-header">
+        <span class="modal-title" id="payModalTitle">Payment</span>
+        <button class="modal-close" onclick="closePayModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <div style="font-size:12px;color:var(--muted);margin-bottom:10px">Enter the booker's details to confirm payment and send a WhatsApp confirmation.</div>
+        <div class="modal-row">
+          <label class="modal-label" for="pay_name">Name</label>
+          <input class="settings-input" id="pay_name" placeholder="Optional">
+        </div>
+        <div class="modal-row">
+          <label class="modal-label" for="pay_phone">Phone</label>
+          <input class="settings-input" id="pay_phone" placeholder="Required — for WhatsApp confirmation" style="font-family:inherit">
+        </div>
+        <div class="modal-divider"></div>
+        <button class="modal-save-btn" onclick="savePayModal()">✓ Confirm &amp; Send WhatsApp</button>
+        <button class="modal-cancel-btn" onclick="closePayModal()">Cancel</button>
       </div>
     </div>
   </div>
