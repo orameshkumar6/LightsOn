@@ -14,7 +14,7 @@ const PRODUCT_INFO = {
 // Plain-text one-liner — for anywhere only text is possible (WhatsApp
 // message signature, plain banners, etc.)
 function productInfoLine() {
-  return `${PRODUCT_INFO.name} | for enquiry ${PRODUCT_INFO.email}`;
+  return `${PRODUCT_INFO.name} | for Intelligent Infrastructure enquiry ${PRODUCT_INFO.email}`;
 }
 
 // Small HTML block — for anywhere markup can render (dashboard footer,

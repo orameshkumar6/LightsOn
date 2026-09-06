@@ -485,7 +485,7 @@
         <div class="settings-sub" style="padding:0">Added automatically when a saved number doesn't start with "+" — e.g. a plain 10-digit local number. Leave the country out of the phone field itself; type "+" there only if a booking's number is from a different country.</div>
       </div>
       <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px">
-        <textarea class="settings-input" id="cfg-whatsapp-template" rows="5" style="font-family:inherit" placeholder="Hi {NAME}, your booking for {PROFILE} - {ROOM} on {DATE} from {START} to {END} is confirmed."></textarea>
+        <textarea class="settings-input" id="cfg-whatsapp-template" rows="5" style="font-family:inherit" placeholder="Hi {NAME}, Your booking for {PROFILE} - {ROOM} on {DATE} from {START} to {END} is confirmed."></textarea>
       </div>
     </div>
     <div class="settings-section">
@@ -1073,7 +1073,7 @@ function buildWhatsAppNumber(raw, countryCode) {
 // slot's details. The code is wrapped in ``` so WhatsApp renders it as a
 // prominent monospace block (WhatsApp has no font-size control, so monospace
 // is the way to make the code stand out).
-const DEFAULT_WHATSAPP_TEMPLATE = 'Hi {NAME}, your booking for {PROFILE} - {ROOM} on {DATE} from {START} to {END} is confirmed.\n\nYour activation code:\n```{CODE}```\n\nActivate with Lights On and enjoy your game.';
+const DEFAULT_WHATSAPP_TEMPLATE = 'Hi {NAME}, Your booking for {PROFILE} - {ROOM} on {DATE} from {START} to {END} is confirmed.\n\nYour activation code:\n```{CODE}```\n\nActivate with Lights On and enjoy your game.';
 
 // PWA-side defaults for the end-of-slot warning, applied to newly created
 // profiles and to old backups on restore (NOT the ESP32 firmware fallback,
