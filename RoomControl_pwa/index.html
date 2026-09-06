@@ -216,8 +216,10 @@
       display: flex; align-items: center; justify-content: center; }
     .time-block.selected { background: var(--accent); color: #fff; border-color: var(--accent); }
     .time-block.anchor { border-color: var(--amber); box-shadow: 0 0 0 2px rgba(240,160,48,0.35); }
+    /* Occupancy marker dot — colour set per-block via --occ-color to match the
+       timeline (green=paid, blue=unpaid, amber=recurring); falls back to amber. */
     .time-block.occupied::after { content: ''; position: absolute; top: 2px; right: 2px;
-      width: 4px; height: 4px; border-radius: 50%; background: var(--amber); }
+      width: 5px; height: 5px; border-radius: 50%; background: var(--occ-color, var(--amber)); }
 
     .settings-section { background: var(--card); border-radius: var(--radius); margin-bottom: 12px; overflow: hidden; }
     .settings-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; padding: 12px 14px 6px; }
@@ -1663,24 +1665,36 @@ function syncGridFromModalTimes() {
   renderGridSelection();
 }
 
-// Marks blocks that overlap an existing slot for the modal's current
-// room+day with a small dot — purely informational, doesn't block picking
-// that range again (overlapping slots are allowed elsewhere in the app too).
+// Marks blocks that overlap an existing slot for the modal's current room+day
+// with a small dot COLOURED by the same scheme as the timeline (green=paid,
+// blue=unpaid, amber=recurring) so the picker reflects each booking's status.
+// Purely informational — doesn't block picking that range again (overlapping
+// slots are allowed elsewhere in the app too). When two slots overlap the same
+// block, the later one in the list wins the colour (minor, informational only).
 function renderGridOccupancy() {
   const r = modalRoomId ? state.rooms.find(x => x.id === modalRoomId) : null;
   const slots = (r && r.slots[modalDay]) || [];
-  const occupied = new Array(GRID_BLOCKS).fill(false);
+  const colors = new Array(GRID_BLOCKS).fill(null); // per-block occupancy colour, or null
+  // Weekday for the day being shown, so dormant recurring slots (not running
+  // that day) don't paint blocks — matches the timeline/dashboard filter.
+  const wd = (new Date().getDay() + modalDay) % 7;
   slots.forEach(sl => {
+    if (sl.recurring && Array.isArray(sl.days) && sl.days.length && !sl.days.includes(wd)) return;
     const [sh, sm] = (sl.s || '').split(':').map(Number);
     const [eh, em] = (sl.e || '').split(':').map(Number);
     if (isNaN(sh) || isNaN(sm) || isNaN(eh) || isNaN(em)) return;
     const si = Math.floor((sh * 60 + sm) / GRID_STEP_MIN);
     const ei = Math.ceil((eh * 60 + em) / GRID_STEP_MIN);
-    for (let i = Math.max(0, si); i < Math.min(GRID_BLOCKS, ei); i++) occupied[i] = true;
+    const col = slotPaymentColor(sl); // var(--amber)/var(--green)/var(--accent)
+    for (let i = Math.max(0, si); i < Math.min(GRID_BLOCKS, ei); i++) colors[i] = col;
   });
   for (let i = 0; i < GRID_BLOCKS; i++) {
     const el = document.getElementById('tb_' + i);
-    if (el) el.classList.toggle('occupied', occupied[i]);
+    if (!el) continue;
+    el.classList.toggle('occupied', colors[i] !== null);
+    // Drive the marker dot colour via a CSS custom property the ::after reads.
+    if (colors[i]) el.style.setProperty('--occ-color', colors[i]);
+    else el.style.removeProperty('--occ-color');
   }
 }
 
