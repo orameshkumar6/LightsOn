@@ -1992,12 +1992,36 @@ function generate4DigitCode() {
 // the activation-field resets in editSlotCode). Recurring instances don't show
 // the chip (payment isn't colour-coded for them), so this only ever runs on
 // one-time slots — but it's harmless if called on one.
+// A 3-choice dialog used when marking a slot Paid from the dashboard chip:
+//   'send'   → confirm + send WhatsApp
+//   'update' → update status only, no message
+//   'cancel' → make no change
+// Native confirm() only has two buttons, so this is a small custom modal that
+// resolves a promise with the chosen action. One resolver at a time.
+let payChoiceResolver = null;
+function askPayChoice() {
+  return new Promise(resolve => {
+    payChoiceResolver = resolve;
+    document.getElementById('payChoiceModal').classList.add('show');
+  });
+}
+function payChoiceSelect(choice) {
+  document.getElementById('payChoiceModal').classList.remove('show');
+  const fn = payChoiceResolver; payChoiceResolver = null;
+  if (fn) fn(choice);
+}
+function payChoiceBackdropClick(e) {
+  // Tapping the backdrop = cancel (no change), matching the Cancel button.
+  if (e.target.id === 'payChoiceModal') payChoiceSelect('cancel');
+}
+
 // Toggle a slot's payment status from the dashboard chip.
 //  • paid → unpaid: just flip it, no prompts.
-//  • unpaid → paid: ask whether to send a WhatsApp confirmation.
-//      – Yes: if a phone is on file, mark paid + send; if not, open the small
-//             window to collect Name + Phone, then mark paid + send.
-//      – No/Cancel: still mark the slot paid, just don't send anything.
+//  • unpaid → paid: show the 3-choice dialog —
+//      – Send WhatsApp: mark paid + save, then send (collect Name/Phone first
+//        if no phone on file).
+//      – Update only:   mark paid + save, no message.
+//      – Cancel:        no change at all (stays unpaid).
 async function toggleSlotPaid(roomId, slotIdx) {
   if (!requireLicense('update payment status')) return;
   const r = state.rooms.find(x => x.id === roomId);
@@ -2017,14 +2041,15 @@ async function toggleSlotPaid(roomId, slotIdx) {
     return;
   }
 
-  // unpaid → paid: ask about the WhatsApp confirmation first.
-  const sendConfirm = confirm('Marked as paid.\n\nSend a WhatsApp confirmation to the customer?');
-  if (!sendConfirm) {
-    // Just record the payment, no message.
+  // unpaid → paid: 3-choice dialog. Nothing is saved until a choice is made,
+  // so Cancel truly leaves the slot unpaid.
+  const choice = await askPayChoice();
+  if (choice === 'cancel') return; // no change
+  if (choice === 'update') {
     await commitSlotPaid(roomId, slotIdx, { sendConfirmation: false });
     return;
   }
-  // They want to send.
+  // choice === 'send'
   if (slot.phone) {
     await commitSlotPaid(roomId, slotIdx, { sendConfirmation: true });
   } else {
@@ -5206,6 +5231,21 @@ function applyUpdate() {
         <div class="modal-divider"></div>
         <button class="modal-save-btn" onclick="savePayModal()">✓ Confirm &amp; Send WhatsApp</button>
         <button class="modal-cancel-btn" onclick="closePayModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Payment: send-confirmation choice (3 options) ────────── -->
+  <div class="modal-overlay" id="payChoiceModal" onclick="payChoiceBackdropClick(event)">
+    <div class="modal-box">
+      <div class="modal-header">
+        <span class="modal-title">Mark as Paid</span>
+      </div>
+      <div class="modal-body">
+        <div style="font-size:13px;color:var(--text);margin-bottom:14px">Send a WhatsApp confirmation to the customer?</div>
+        <button class="modal-save-btn" onclick="payChoiceSelect('send')">✓ Confirm &amp; Send WhatsApp</button>
+        <button class="modal-cancel-btn" onclick="payChoiceSelect('update')">Update only (no message)</button>
+        <button class="modal-cancel-btn" onclick="payChoiceSelect('cancel')">Cancel</button>
       </div>
     </div>
   </div>
