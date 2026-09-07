@@ -3033,6 +3033,32 @@ async function manualSyncFromFirebase(opts) {
       state.rooms[idx].slots[0] = normalizeSlots(remote.slots);
       state.rooms[idx].slots[1] = normalizeSlots(remote.slotsT);
       state.rooms[idx].recurringDefs = normalizeSlots(remote.recurring);
+      // MANUAL sync only: also pull the room's manual override (Force ON/OFF/
+      // Auto) so a change made on another device shows here. The live SSE /
+      // polling / on-load auto-sync paths intentionally DON'T do this (they
+      // accept only null) to avoid churn — the manual Sync button is the
+      // explicit "get the latest" action, so it's the right place. Skip a
+      // room that's _dirty (a local override set on THIS device that hasn't
+      // pushed yet — step 1 above already tried; if it's still dirty the push
+      // failed, so don't clobber the pending local value). Only accept a real
+      // tri-state (true/false/null) from Firebase.
+      if (!silent && !state.rooms[idx]._dirty &&
+          (remote.override === true || remote.override === false || remote.override === null)) {
+        state.rooms[idx].override = remote.override;
+        // Reflect that this value came FROM Firebase, so the SSE echo guard
+        // doesn't immediately treat it as a local write.
+        overrideWriteTime[idx] = 0;
+      }
+      // MANUAL sync only: also pull the room-level scalar fields another device
+      // may have changed — the room NAME (shown across the app) and the relay/
+      // LED GPIO pins (so device B's Settings form matches). Same !_dirty guard
+      // so an unsynced local edit on THIS device isn't clobbered. Only assign
+      // when Firebase actually has a value, so a partial node can't blank them.
+      if (!silent && !state.rooms[idx]._dirty) {
+        if (typeof remote.name === 'string' && remote.name.trim()) state.rooms[idx].name = remote.name;
+        if (remote.relayPin === null || typeof remote.relayPin === 'number') state.rooms[idx].relayPin = remote.relayPin;
+        if (remote.ledPin === null || typeof remote.ledPin === 'number') state.rooms[idx].ledPin = remote.ledPin;
+      }
       updated++;
     });
     // ── 3. PULL shared /config back into the active profile ──
@@ -3044,6 +3070,19 @@ async function manualSyncFromFirebase(opts) {
     let cfgChanged = false;
     if (!silent) {
       try { cfgChanged = await pullConfigFromFirebase(p); } catch (e) { addLog('error', 'Config sync failed: ' + e.message); }
+      // MANUAL sync only: pull the profile's display NAME from /profiles/{n}/name
+      // so a rename made on another device shows in the header here. Only the
+      // active profile is synced (the one this device is pointed at). fbGet('/name')
+      // resolves to /profiles/{fbNum}/name via the profile prefix. Guarded so an
+      // empty/missing value never blanks the local name.
+      try {
+        const remoteName = await fbGet('/name', p);
+        if (typeof remoteName === 'string' && remoteName.trim() && remoteName !== p.name) {
+          p.name = remoteName;
+          cfgChanged = true;      // triggers renderSettings below
+          updateHeaderProfile();  // refresh the header label/selector immediately
+        }
+      } catch (e) { /* non-critical — header just keeps the local name */ }
     }
     persist();
     renderDashboard(); // timeline re-renders on its own when that tab is opened (showPage)
