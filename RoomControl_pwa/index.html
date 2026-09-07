@@ -335,11 +335,14 @@
        pin + warn-minutes rows inside the End-of-slot warning section). */
     body:not(.admin-mode) #page-settings > .settings-section:not(.admin-exempt),
     body:not(.admin-mode) #page-settings > .qr-section,
-    body:not(.admin-mode) #page-settings > .save-btn,
     body:not(.admin-mode) #page-settings > .test-btn,
     body:not(.admin-mode) #page-settings .admin-only {
       display: none !important;
     }
+    /* The main "Save changes to this profile" button stays visible in the
+       simplified (non-admin) view — that view still has editable fields (beep
+       settings), so the user must be able to save. Only the advanced actions
+       (.test-btn: Save-as-new-profile / Test connection) stay hidden. */
     /* ── No active license — full app block ───────────────────── */
     .license-expired-blocker { position: fixed; inset: 0; z-index: 9999;
       background: var(--bg); display: none; align-items: center; justify-content: center;
@@ -503,6 +506,10 @@
       <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px">
         <div class="settings-label">Emergency light GPIO pin<div class="settings-sub">Leave blank if not wired</div></div>
         <input class="settings-input" id="cfg-emergency-pin" type="number" min="0" max="39" placeholder="e.g. 33" style="font-family:monospace;max-width:120px">
+      </div>
+      <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px">
+        <div class="settings-label">Emergency light auto-off (minutes)<div class="settings-sub">Turn the emergency light off after it has been on this long continuously. Blank or 0 = never auto-off. Re-arms whenever a room turns on again. Reboot the ESP32 to apply.</div></div>
+        <input class="settings-input" id="cfg-emergency-timeout" type="number" min="0" placeholder="e.g. 30" style="font-family:monospace;max-width:120px">
       </div>
     </div>
     <div class="settings-section admin-exempt">
@@ -2954,6 +2961,7 @@ async function pullConfigFromFirebase(p) {
   if (cfg.adminSeed !== undefined && cfg.adminSeed !== null)
     setIf('adminSeed', String(cfg.adminSeed));
   if ('emergencyPin' in cfg) setIf('emergencyPin', numOrNull(cfg.emergencyPin));
+  if ('emergencyTimeout' in cfg) setIf('emergencyTimeout', numOrNull(cfg.emergencyTimeout));
   if ('beeperPin' in cfg)    setIf('beeperPin',    numOrNull(cfg.beeperPin));
   if ('warnMinutes' in cfg)  setIf('warnMinutes',  numOrNull(cfg.warnMinutes));
   if ('beepMs' in cfg)       setIf('beepMs',       numOrNull(cfg.beepMs));
@@ -4226,6 +4234,7 @@ function renderSettings() {
   document.getElementById('rw-nc').className = 'ov-btn' + (relayWiring === 'NC' ? ' active-auto' : '');
   document.getElementById('rw-no').className = 'ov-btn' + (relayWiring === 'NO' ? ' active-auto' : '');
   document.getElementById('cfg-emergency-pin').value = (p.emergencyPin === null || p.emergencyPin === undefined) ? '' : p.emergencyPin;
+  document.getElementById('cfg-emergency-timeout').value = (p.emergencyTimeout === null || p.emergencyTimeout === undefined) ? '' : p.emergencyTimeout;
   document.getElementById('cfg-beeper-pin').value = (p.beeperPin === null || p.beeperPin === undefined) ? '' : p.beeperPin;
   document.getElementById('cfg-warn-minutes').value = (p.warnMinutes === null || p.warnMinutes === undefined) ? '' : p.warnMinutes;
   document.getElementById('cfg-beep-ms').value = (p.beepMs === null || p.beepMs === undefined) ? '' : p.beepMs;
@@ -4411,6 +4420,10 @@ async function saveActiveProfile() {
   p.whatsappCountryCode = document.getElementById('cfg-whatsapp-country-code').value.trim().replace(/[^\d]/g, '') || '91';
   const emergencyPinVal = document.getElementById('cfg-emergency-pin').value.trim();
   p.emergencyPin = emergencyPinVal === '' ? null : parseInt(emergencyPinVal, 10);
+  // Emergency light auto-off timeout in minutes. Blank/0/invalid → null (never
+  // auto-off, the original always-on behaviour).
+  const emergencyTimeoutVal = parseInt(document.getElementById('cfg-emergency-timeout').value.trim(), 10);
+  p.emergencyTimeout = (isNaN(emergencyTimeoutVal) || emergencyTimeoutVal <= 0) ? null : emergencyTimeoutVal;
   const beeperPinVal = document.getElementById('cfg-beeper-pin').value.trim();
   p.beeperPin = beeperPinVal === '' ? null : parseInt(beeperPinVal, 10);
   // Blank or 0 (or anything non-positive) disables the warning — store null
@@ -4510,6 +4523,7 @@ function finishSaveSettings(p, message) {
   if (p.dbUrl) {
     fbSet('/config/adminSeed', p.adminSeed, p);
     fbSet('/config/emergencyPin', p.emergencyPin === null || p.emergencyPin === undefined ? null : p.emergencyPin, p);
+    fbSet('/config/emergencyTimeout', p.emergencyTimeout === null || p.emergencyTimeout === undefined ? null : p.emergencyTimeout, p);
     fbSet('/config/beeperPin', p.beeperPin === null || p.beeperPin === undefined ? null : p.beeperPin, p);
     fbSet('/config/warnMinutes', p.warnMinutes === null || p.warnMinutes === undefined ? null : p.warnMinutes, p);
     fbSet('/config/beepMs', p.beepMs === null || p.beepMs === undefined ? null : p.beepMs, p);
@@ -4699,6 +4713,7 @@ function restoreFromFile(event) {
         if (p.whatsappCountryCode === undefined || p.whatsappCountryCode === null || p.whatsappCountryCode === '') p.whatsappCountryCode = '91';
         if (p.relayWiring !== 'NC' && p.relayWiring !== 'NO') p.relayWiring = 'NC';
         if (!('emergencyPin' in p)) p.emergencyPin = null;
+        if (!('emergencyTimeout' in p)) p.emergencyTimeout = null;
         if (!('beeperPin' in p))    p.beeperPin = null;
         // warn/beep default to sensible values (not null) for old backups that
         // predate these fields — matches the new-profile defaults.
