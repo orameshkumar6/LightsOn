@@ -91,6 +91,18 @@ const int PIN_NONE = -1;  // sentinel: not configured
 // NC wiring means it's ON by default even if the ESP32 itself loses power.
 int emergencyPin = PIN_NONE;
 
+// Optional auto-off timeout for the emergency light (minutes). Read from
+// /config/emergencyTimeout, 0 (or unset) = disabled = the original always-on
+// behaviour. When >0, the emergency light turns OFF after it has been ON
+// continuously for this many minutes, and re-arms the next time a room turns
+// on (which ends the all-off standby period). emergencyOnSince is the millis()
+// timestamp when the current continuous-ON period began (0 = not currently on);
+// emergencyLatchedOff is set once the timeout fires so we hold it off without
+// re-toggling every tick, and cleared when standby ends (a room comes on).
+int  emergencyTimeoutMin  = 0;      // 0 = disabled
+unsigned long emergencyOnSince = 0; // millis() when the light last turned ON
+bool emergencyLatchedOff  = false;  // true = timed out, held off until re-arm
+
 // ── End-of-slot warning — shared beeper + per-room LED blink ──
 // A single controller-wide beeper (not per-room) sounds a short burst when
 // any room's ACTIVE slot enters its final warnMinutes, and that room's own
@@ -571,6 +583,21 @@ void applyEmergencyPinConfig() {
   }
 }
 
+// ── Emergency light auto-off timeout — read once at boot ──────────────
+// Same bare-scalar /config read. Missing/null/error/<=0 → 0 (disabled), so the
+// emergency light stays always-on for setups that haven't opted in.
+void applyEmergencyTimeoutConfig() {
+  String val = fbGet("/config/emergencyTimeout");
+  int m = val.toInt();
+  if (val == "" || val == "null" || val == "error" || m <= 0) {
+    emergencyTimeoutMin = 0;
+    Serial.println("Emergency light auto-off: disabled");
+  } else {
+    emergencyTimeoutMin = m;
+    Serial.printf("Emergency light auto-off: %d min\n", emergencyTimeoutMin);
+  }
+}
+
 // ── Shared end-of-slot warning beeper pin — read once at boot ─────────
 // Same bare-scalar /config read as applyEmergencyPinConfig(). Missing/null/
 // error → PIN_NONE, so no beeper is ever driven (backward-compatible off).
@@ -632,7 +659,41 @@ void updateEmergencyLight() {
   for (int i = 0; i < roomCount; i++) {
     if (rooms[i].lightOn) { allOff = false; break; }
   }
-  digitalWrite(emergencyPin, allOff ? RELAY_ON : RELAY_OFF);
+
+  if (!allOff) {
+    // A room is on → emergency light off, and reset the standby timer + latch
+    // so the timeout re-arms for the NEXT all-off period (re-arm on activity).
+    digitalWrite(emergencyPin, RELAY_OFF);
+    emergencyOnSince = 0;
+    emergencyLatchedOff = false;
+    return;
+  }
+
+  // All rooms are off → the emergency light wants to be ON.
+  if (emergencyTimeoutMin <= 0) {
+    // No timeout configured — original always-on-while-standby behaviour.
+    digitalWrite(emergencyPin, RELAY_ON);
+    return;
+  }
+
+  // Timeout is configured. Start the standby timer on the rising edge (the
+  // moment we enter the all-off period).
+  if (emergencyOnSince == 0 && !emergencyLatchedOff) {
+    emergencyOnSince = millis();
+  }
+  // If we've already timed out this standby period, keep it off.
+  if (emergencyLatchedOff) {
+    digitalWrite(emergencyPin, RELAY_OFF);
+    return;
+  }
+  // Still within the allowed window → on; past it → latch off.
+  if (millis() - emergencyOnSince >= (unsigned long)emergencyTimeoutMin * 60000UL) {
+    emergencyLatchedOff = true;
+    digitalWrite(emergencyPin, RELAY_OFF);
+    Serial.printf("[%s] Emergency light auto-off after %d min standby\n", getTime().c_str(), emergencyTimeoutMin);
+  } else {
+    digitalWrite(emergencyPin, RELAY_ON);
+  }
 }
 
 // ── Read all rooms from Firebase — pins, overrides, names, slots ──
@@ -1310,6 +1371,11 @@ void checkSchedules() {
       pushStatus(i);
     }
   }
+  // Re-evaluate the emergency light every tick too — its auto-off timeout must
+  // fire during a long standby when no room state changes (setRelay() only
+  // calls this on a change). No-op when the pin is unconfigured or the timeout
+  // is disabled and the light is already in the right state.
+  updateEmergencyLight();
 }
 
 // ── WiFi watchdog — relies on WiFi.setAutoReconnect(); this just
@@ -1489,6 +1555,7 @@ void setup() {
   readAllRooms(); // fills pins/names/overrides/slots for rooms[0..roomCount-1]
   applyRelayWiringConfig();  // must run before pin init below, so RELAY_OFF is already correct
   applyEmergencyPinConfig(); // same — emergencyPin must be known before pinMode() below
+  applyEmergencyTimeoutConfig(); // emergency light auto-off timeout (0 = disabled)
   applyBeeperPinConfig();    // shared end-of-slot beeper pin (off/PIN_NONE if unconfigured)
   applyWarnMinutesConfig();  // warn window in minutes (0 = feature disabled)
   applyBeepConfig();         // per-beep duration + count (defaults 250ms, 1)
