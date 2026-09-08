@@ -1187,40 +1187,29 @@ void checkMidnight() {
 }
 
 // ── Mark slot as expired in Firebase ─────────────────────────
+// Writes ONLY the single field /rooms/roomN/slots/{slotIdx}/expired = true —
+// a targeted per-field write, NOT a full-array rewrite.
+//
+// The previous version fetched the whole /slots array, located the slot by a
+// start-time STRING match (first "s":"HH:MM" occurrence — no unique id), spliced
+// expired:true in, and PUT the entire array back. That had two problems with
+// adjacent/coded slots: (1) it matched only by start time with no per-slot id,
+// and (2) the read-modify-write of the whole array raced with the PWA's own
+// per-slot writes — either side's full-array PUT could clobber the other's
+// changes, which could drop/merge slots. Writing just the one field by the
+// index we already hold removes both the string-match fragility and the race:
+// it touches nothing else in the array, so it can never merge or delete slots.
 void markSlotExpired(int roomIdx, int slotIdx) {
-  String path = "/rooms/room" + String(roomIdx + 1) + "/slots";
-  String slotsJson = fbGet(path);
-  if (slotsJson == "error" || slotsJson == "null" || slotsJson.length() < 5) return;
-
-  // Find and update the matching slot — add expired:true
-  // Simple approach: find the slot by time and inject expired field
+  if (slotIdx < 0 || slotIdx >= rooms[roomIdx].slotCount) return;
+  // Never expire a slot that's currently activated — the firmware already
+  // tracks this per slot, so we don't need to fetch/parse the array to know it.
+  if (rooms[roomIdx].slots[slotIdx].activated) return;
+  String path = "/rooms/room" + String(roomIdx + 1) + "/slots/" + String(slotIdx) + "/expired";
+  fbPut(path, "true");
   char startBuf[6], endBuf[6];
   snprintf(startBuf, 6, "%02d:%02d", rooms[roomIdx].slots[slotIdx].sh, rooms[roomIdx].slots[slotIdx].sm);
   snprintf(endBuf,   6, "%02d:%02d", rooms[roomIdx].slots[slotIdx].eh, rooms[roomIdx].slots[slotIdx].em);
-
-  String searchKey = String("\"s\":\"") + startBuf + "\"";
-  int pos = slotsJson.indexOf(searchKey);
-  if (pos < 0) return;
-
-  // Find the slot object boundaries
-  int objStart = slotsJson.lastIndexOf('{', pos);
-  int objEnd   = slotsJson.indexOf('}', pos);
-  if (objStart < 0 || objEnd < 0) return;
-
-  String slotObj = slotsJson.substring(objStart, objEnd + 1);
-  // Only mark expired if not already activated
-  if (slotObj.indexOf("\"activatedAt\":null") >= 0 ||
-      slotObj.indexOf("\"activatedAt\":") < 0) {
-    // Add expired:true to the slot object
-    String newSlotObj = slotObj.substring(0, slotObj.length() - 1);
-    newSlotObj += ",\"expired\":true}";
-    String newSlotsJson = slotsJson.substring(0, objStart) +
-                         newSlotObj +
-                         slotsJson.substring(objEnd + 1);
-    fbPut(path, newSlotsJson);
-    Serial.printf("Room %d slot %s-%s marked expired\n",
-      roomIdx+1, startBuf, endBuf);
-  }
+  Serial.printf("Room %d slot %s-%s marked expired\n", roomIdx+1, startBuf, endBuf);
 }
 
 // ── End-of-slot warning ──────────────────────────────────────
