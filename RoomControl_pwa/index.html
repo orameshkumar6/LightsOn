@@ -3018,14 +3018,7 @@ async function manualSyncFromFirebase(opts) {
           Object.keys(pre).forEach(key => {
             const idx = parseInt(key.replace('room', ''), 10) - 1;
             if (idx < 0 || idx >= state.rooms.length) return;
-            const ro = (pre[key] || {}).override;
-            const lastW = overrideWriteTime[idx] || 0;
-            const justSetHere = (Date.now() - lastW) < 30000;
-            if (!justSetHere && (ro === true || ro === false || ro === null) &&
-                state.rooms[idx].override !== ro) {
-              state.rooms[idx].override = ro;
-              overrideWriteTime[idx] = 0;
-            }
+            reconcileOverride(state.rooms[idx], pre[key] || {});
           });
         }
       } catch (e) { /* non-fatal — the post-push pull below still reconciles */ }
@@ -3067,24 +3060,8 @@ async function manualSyncFromFirebase(opts) {
       // polling / on-load auto-sync paths intentionally DON'T do this (they
       // accept only null) to avoid churn — the manual Sync button is the
       // explicit "get the latest" action, so it's the right place. Skip a
-      // Firebase is authoritative for the override on an explicit manual Sync.
-      // We do NOT gate this on _dirty: a room can get stuck _dirty (a push that
-      // returned non-OK, an offline moment), and the old !_dirty guard then
-      // FROZE the override on this device forever — tapping Sync could never
-      // pull another device's change (the reported "device B stuck on Manual
-      // ON" bug). Instead we only skip if THIS device set an override in the
-      // last 30s (overrideWriteTime), so a value the user just tapped here isn't
-      // bounced by a slightly-older remote echo — but any older local value
-      // yields to Firebase. Accept only a real tri-state (true/false/null).
-      const lastOvrWrite = overrideWriteTime[idx] || 0;
-      const justSetOverrideHere = (Date.now() - lastOvrWrite) < 30000;
-      if (!silent && !justSetOverrideHere &&
-          (remote.override === true || remote.override === false || remote.override === null)) {
-        state.rooms[idx].override = remote.override;
-        // Mark as Firebase-sourced so the SSE echo guard doesn't treat it as a
-        // local write.
-        overrideWriteTime[idx] = 0;
-      }
+      // Override: last-write-wins by overrideAt timestamp (see reconcileOverride).
+      if (!silent) reconcileOverride(state.rooms[idx], remote);
       // MANUAL sync only: also pull the room-level scalar fields another device
       // may have changed — the room NAME (shown across the app) and the relay/
       // LED GPIO pins (so device B's Settings form matches). Same !_dirty guard
@@ -3191,9 +3168,15 @@ async function pushRoom(idx, profile) {
                  // when the whole room pushed successfully, so a failed
                  // (e.g. offline) write leaves it queued for the next Sync.
 
-  // Write room-level fields first
+  // Write room-level fields first. overrideAt is the last-write-wins timestamp
+  // for the override: because RTDB DELETES a key PATCHed with null, "Auto"
+  // (override:null) removes the override key entirely — so on read we can't tell
+  // "Auto" from "never set". overrideAt survives (it's a number, not null) and
+  // records WHEN the override last changed, letting sync pick the newest change
+  // across devices regardless of whether the value is ON/OFF/Auto.
   ok = await fbPatch(roomBase, {
     override: r.override,
+    overrideAt: (typeof r.overrideAt === 'number') ? r.overrideAt : null,
     name: r.name,
     relayPin: r.relayPin,
     ledPin: r.ledPin,
@@ -3647,9 +3630,41 @@ function setRecurring(id, field, val) {
 //  management modal, which writes to r.recurringDefs and re-materializes the
 //  day buckets via rematerializeRecurringBuckets(). See saveRecurringFromModal.)
 
+// Reconcile a room's manual override against a remote Firebase room object,
+// using LAST-WRITE-WINS by the overrideAt timestamp. Called on manual Sync
+// (pre-push reconcile + post-pull). Rules:
+//  • Remote override is normalized: a MISSING key means "Auto" (null), because
+//    RTDB deletes a key PATCHed with null — so absent ≡ Auto, not "unknown".
+//  • The side with the NEWER overrideAt wins. If remote is newer (or equal and
+//    different), adopt remote and clear this room's local override-write guard.
+//  • If this device set the override more recently (local overrideAt newer, or
+//    within the 30s just-tapped window), keep local so a fresh tap isn't bounced.
+//  • Missing timestamps are treated as 0 (oldest), so any timestamped change
+//    wins over legacy data that predates overrideAt.
+function reconcileOverride(localRoom, remote) {
+  if (!localRoom || !remote || typeof remote !== 'object') return;
+  const remoteOvr = ('override' in remote) ? remote.override : null; // absent = Auto
+  if (remoteOvr !== true && remoteOvr !== false && remoteOvr !== null) return; // ignore junk
+  const remoteAt = (typeof remote.overrideAt === 'number') ? remote.overrideAt : 0;
+  const localAt  = (typeof localRoom.overrideAt === 'number') ? localRoom.overrideAt : 0;
+  const idx = localRoom.id - 1;
+  const lastW = overrideWriteTime[idx] || 0;
+  const justSetHere = (Date.now() - lastW) < 30000;
+  // Keep local if this device just tapped it, or its timestamp is strictly newer.
+  if (justSetHere || localAt > remoteAt) return;
+  // Otherwise remote wins (newer, or equal-age tiebreak → adopt authoritative).
+  if (localRoom.override !== remoteOvr || localRoom.overrideAt !== remoteAt) {
+    localRoom.override = remoteOvr;
+    localRoom.overrideAt = remoteAt;
+    overrideWriteTime[idx] = 0; // Firebase-sourced — not a local write
+  }
+}
+
 async function setOverride(id, val) {
   const r = state.rooms.find(x => x.id === id);
   r.override = val;
+  r.overrideAt = Date.now(); // last-write-wins timestamp — synced so the newest
+                             // override change wins across devices (see manualSyncFromFirebase)
   overrideWriteTime[id - 1] = Date.now();
   markRoomDirty(id - 1);
   persist(); renderDashboard();
@@ -3659,8 +3674,10 @@ async function setOverride(id, val) {
 }
 
 async function allRooms(val) {
+  const now = Date.now();
   state.rooms.forEach((r, i) => {
     r.override = val;
+    r.overrideAt = now; // last-write-wins timestamp (synced)
     overrideWriteTime[i] = Date.now();
   });
   persist(); renderDashboard();
