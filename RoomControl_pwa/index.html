@@ -512,6 +512,14 @@
         <input class="settings-input" id="cfg-emergency-timeout" type="number" min="0" placeholder="e.g. 30" style="font-family:monospace;max-width:120px">
       </div>
     </div>
+    <div class="settings-section">
+      <div class="settings-title">Activation page</div>
+      <div class="settings-sub" style="padding:0 14px 8px">Controls the customer QR activation page.</div>
+      <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px">
+        <div class="settings-label">Show slots within (hours)<div class="settings-sub">The activation page shows only slots starting within this many hours from now. Blank = 4 (default). 0 = show all upcoming slots.</div></div>
+        <input class="settings-input" id="cfg-activate-window" type="number" min="0" placeholder="4" style="font-family:monospace;max-width:120px">
+      </div>
+    </div>
     <div class="settings-section admin-exempt">
       <div class="settings-title">End-of-slot warning</div>
       <div class="settings-sub admin-only" style="padding:0 14px 8px">A single shared beeper sounds one short beep when any room's active slot is a few minutes from ending, and that room's own LED starts blinking for the rest of the window. Leave both blank to disable — existing setups are unaffected. Applied to this profile's Firebase; the ESP32 needs a reboot to pick up a pin change.</div>
@@ -2962,6 +2970,12 @@ async function pullConfigFromFirebase(p) {
     setIf('adminSeed', String(cfg.adminSeed));
   if ('emergencyPin' in cfg) setIf('emergencyPin', numOrNull(cfg.emergencyPin));
   if ('emergencyTimeout' in cfg) setIf('emergencyTimeout', numOrNull(cfg.emergencyTimeout));
+  // activateWindowHours: an explicit 0 ("show all") is valid and distinct from
+  // null/blank ("use the 4h default"), so preserve 0 rather than treating it as null.
+  if ('activateWindowHours' in cfg) {
+    const awh = (cfg.activateWindowHours === null || cfg.activateWindowHours === undefined || cfg.activateWindowHours === '') ? null : Math.max(0, parseInt(cfg.activateWindowHours, 10) || 0);
+    setIf('activateWindowHours', awh);
+  }
   if ('beeperPin' in cfg)    setIf('beeperPin',    numOrNull(cfg.beeperPin));
   if ('warnMinutes' in cfg)  setIf('warnMinutes',  numOrNull(cfg.warnMinutes));
   if ('beepMs' in cfg)       setIf('beepMs',       numOrNull(cfg.beepMs));
@@ -4327,6 +4341,7 @@ function renderSettings() {
   document.getElementById('rw-no').className = 'ov-btn' + (relayWiring === 'NO' ? ' active-auto' : '');
   document.getElementById('cfg-emergency-pin').value = (p.emergencyPin === null || p.emergencyPin === undefined) ? '' : p.emergencyPin;
   document.getElementById('cfg-emergency-timeout').value = (p.emergencyTimeout === null || p.emergencyTimeout === undefined) ? '' : p.emergencyTimeout;
+  document.getElementById('cfg-activate-window').value = (p.activateWindowHours === null || p.activateWindowHours === undefined) ? '' : p.activateWindowHours;
   document.getElementById('cfg-beeper-pin').value = (p.beeperPin === null || p.beeperPin === undefined) ? '' : p.beeperPin;
   document.getElementById('cfg-warn-minutes').value = (p.warnMinutes === null || p.warnMinutes === undefined) ? '' : p.warnMinutes;
   document.getElementById('cfg-beep-ms').value = (p.beepMs === null || p.beepMs === undefined) ? '' : p.beepMs;
@@ -4516,6 +4531,11 @@ async function saveActiveProfile() {
   // auto-off, the original always-on behaviour).
   const emergencyTimeoutVal = parseInt(document.getElementById('cfg-emergency-timeout').value.trim(), 10);
   p.emergencyTimeout = (isNaN(emergencyTimeoutVal) || emergencyTimeoutVal <= 0) ? null : emergencyTimeoutVal;
+  // Activation-page window (hours). Blank → null (activate.html defaults to 4).
+  // An explicit 0 is kept (means "show all") — distinct from blank/null.
+  const activateWindowRaw = document.getElementById('cfg-activate-window').value.trim();
+  const activateWindowVal = parseInt(activateWindowRaw, 10);
+  p.activateWindowHours = activateWindowRaw === '' || isNaN(activateWindowVal) || activateWindowVal < 0 ? null : activateWindowVal;
   const beeperPinVal = document.getElementById('cfg-beeper-pin').value.trim();
   p.beeperPin = beeperPinVal === '' ? null : parseInt(beeperPinVal, 10);
   // Blank or 0 (or anything non-positive) disables the warning — store null
@@ -4616,6 +4636,7 @@ function finishSaveSettings(p, message) {
     fbSet('/config/adminSeed', p.adminSeed, p);
     fbSet('/config/emergencyPin', p.emergencyPin === null || p.emergencyPin === undefined ? null : p.emergencyPin, p);
     fbSet('/config/emergencyTimeout', p.emergencyTimeout === null || p.emergencyTimeout === undefined ? null : p.emergencyTimeout, p);
+    fbSet('/config/activateWindowHours', p.activateWindowHours === null || p.activateWindowHours === undefined ? null : p.activateWindowHours, p);
     fbSet('/config/beeperPin', p.beeperPin === null || p.beeperPin === undefined ? null : p.beeperPin, p);
     fbSet('/config/warnMinutes', p.warnMinutes === null || p.warnMinutes === undefined ? null : p.warnMinutes, p);
     fbSet('/config/beepMs', p.beepMs === null || p.beepMs === undefined ? null : p.beepMs, p);
@@ -4806,6 +4827,7 @@ function restoreFromFile(event) {
         if (p.relayWiring !== 'NC' && p.relayWiring !== 'NO') p.relayWiring = 'NC';
         if (!('emergencyPin' in p)) p.emergencyPin = null;
         if (!('emergencyTimeout' in p)) p.emergencyTimeout = null;
+        if (!('activateWindowHours' in p)) p.activateWindowHours = null;
         if (!('beeperPin' in p))    p.beeperPin = null;
         // warn/beep default to sensible values (not null) for old backups that
         // predate these fields — matches the new-profile defaults.

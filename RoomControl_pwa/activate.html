@@ -259,6 +259,18 @@ async function loadSlots() {
     const seedVal = await fbGet('/config/adminSeed');
     if (seedVal) adminSeed = String(seedVal);
 
+    // How many hours ahead of "now" to show slots for. Read from
+    // /config/activateWindowHours. Missing/invalid → 4 (so existing sites get a
+    // sensible 4-hour window automatically). An explicit 0 disables the window
+    // (shows all not-yet-ended slots, the old behaviour). Only the START time is
+    // gated: a slot shows if it's already running or starts within the window.
+    let windowHours = 4;
+    const winVal = await fbGet('/config/activateWindowHours');
+    const winNum = parseInt(winVal, 10);
+    if (winVal === 0 || winVal === '0') windowHours = 0;       // explicit disable
+    else if (!isNaN(winNum) && winNum > 0) windowHours = winNum;
+    const windowEndMins = windowHours > 0 ? nm + windowHours * 60 : Infinity;
+
     // Read rooms list for names
     const rooms = await fbGet('/rooms');
     if (!rooms) { showError('Could not connect to Firebase.<br>Check your internet connection.'); return; }
@@ -293,6 +305,7 @@ async function loadSlots() {
       slots.forEach((sl, originalIndex) => {
         if (sl.date === tomorrowStr()) return; // skip tomorrow
         if (toMins(sl.e) <= nm) return;        // skip ended
+        if (toMins(sl.s) > windowEndMins) return; // skip slots starting beyond the configured window
         // Day-of-week recurrence: a recurring slot with a days list only shows
         // on its configured weekdays. No days list (or non-recurring) = every day.
         if (sl.recurring && Array.isArray(sl.days) && sl.days.length &&
