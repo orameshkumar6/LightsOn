@@ -3603,13 +3603,6 @@ async function pushRoom(idx, profile) {
   const remoteSlotsArr = normalizeSlots(existingSlotsRaw);
   const remoteById = new Map();
   remoteSlotsArr.forEach(sl => { if (sl && sl.id) remoteById.set(sl.id, sl); });
-  // Before this feature shipped, /slots never carried an id at all — so on
-  // the FIRST push after upgrading, every remote slot in a room still looks
-  // "unmatched" even though it's the very slot a local entry represents.
-  // Correlate by position for this one transitional push only (matching the
-  // old behavior exactly), so nothing gets written twice. From the next push
-  // on, every slot has an id and this fallback never triggers again.
-  const noRemoteIdsYet = remoteSlotsArr.length > 0 && remoteById.size === 0;
   const syncedSlotIds = new Set(Array.isArray(r._syncedSlotIds) ? r._syncedSlotIds : []);
 
   let slotConflict = false;
@@ -3651,9 +3644,20 @@ async function pushRoom(idx, profile) {
     const sl = todaySlots[si];
     if (!sl.id) sl.id = makeSlotId();
     let remote = remoteById.get(sl.id);
-    if (!remote && noRemoteIdsYet) {
+    // Legacy fallback, evaluated PER SLOT (not gated on the whole bucket
+    // being id-less): before this feature shipped, /slots never carried an
+    // id, so a slot that predates the upgrade still looks "unmatched" even
+    // though the positional entry IS the same slot. Only ever applies to a
+    // remote entry that itself still has no id — one that's already been
+    // migrated (by any device touching it) is a real, distinct slot and
+    // must never be silently claimed here. Gating this on a bucket-wide
+    // flag instead of per-slot caused duplicates: once ANY slot in a room
+    // had a real id, the flag went false and every OTHER still-legacy slot
+    // in that same bucket got created fresh instead of recognized, while
+    // its old id-less remote twin got backfilled an id and kept too.
+    if (!remote) {
       const positional = remoteSlotsArr[si];
-      if (positional && !positional.id) remote = positional;
+      if (positional && !positional.id && !consumedRemote.has(positional)) remote = positional;
     }
     if (remote) consumedRemote.add(remote);
 
@@ -3771,7 +3775,6 @@ async function pushRoom(idx, profile) {
   const remoteDefsArr = normalizeSlots(existingDefsRaw);
   const remoteDefById = new Map();
   remoteDefsArr.forEach(d => { if (d && d.id) remoteDefById.set(d.id, d); });
-  const noRemoteDefIdsYet = remoteDefsArr.length > 0 && remoteDefById.size === 0;
   const syncedDefIds = new Set(Array.isArray(r._syncedRecurDefIds) ? r._syncedRecurDefIds : []);
 
   let defConflict = false;
@@ -3794,9 +3797,11 @@ async function pushRoom(idx, profile) {
     const d = defs[di];
     if (!d.id) d.id = makeRecurDefId();
     let remote = remoteDefById.get(d.id);
-    if (!remote && noRemoteDefIdsYet) {
+    // Same per-slot legacy fallback as the slots section above — only ever
+    // claims a positional remote def that itself still has no id.
+    if (!remote) {
       const positional = remoteDefsArr[di];
-      if (positional && !positional.id) remote = positional;
+      if (positional && !positional.id && !consumedRemoteDefs.has(positional)) remote = positional;
     }
     if (remote) consumedRemoteDefs.add(remote);
 
