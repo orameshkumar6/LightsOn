@@ -458,6 +458,21 @@ async function submitRequest() {
 document.getElementById('headerDate').textContent =
   new Date().toLocaleDateString([], { weekday:'long', month:'long', day:'numeric' });
 
+// Show the profile's display name in front of the "Request a Booking"
+// heading — same mechanism as activate.html's loadProfileName(). The name
+// is a display-only property at /profiles/{p}/name; fbGet is already
+// prefixed with /profiles/{PROFILE_NUM}.
+async function loadProfileName() {
+  if (!FIREBASE_URL || !PROFILE_NUM) return;
+  try {
+    const name = await fbGet('/name');
+    if (name) {
+      document.getElementById('profileName').textContent = name + ' — ';
+    }
+  } catch (e) { /* non-critical; heading falls back to "Request a Booking" */ }
+}
+loadProfileName();
+
 // ── Auto-close (lifetime + idle) — same pattern as activate.html ────────
 // This page is meant to be short-lived too: 3 minutes idle, or a generous
 // 10-minute hard cap regardless of activity. Browsers only allow a
