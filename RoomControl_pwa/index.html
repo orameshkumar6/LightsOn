@@ -3673,6 +3673,17 @@ async function pushRoom(idx, profile) {
       continue;
     }
 
+    // This local slot's id matched nothing in the CURRENT remote snapshot
+    // (neither by id nor the legacy positional fallback above). If this
+    // device previously confirmed that exact id really was saved to
+    // Firebase (it's in _syncedSlotIds), that's not a brand-new local slot —
+    // it means someone else deleted it since this device's last sync. A
+    // stale device's local cache still remembering a deleted slot must
+    // never resurrect it just by pushing again; respect the deletion and
+    // drop it from this device's own state too. Only a genuinely new slot
+    // (never confirmed synced) reaches the create path below.
+    if (!remote && syncedSlotIds.has(sl.id)) continue;
+
     const patch = buildSlotPatch(sl);
     patch.slotTs = Date.now();
     // expired IS explicitly reset here (unlike activatedAt/attempts/
@@ -3815,6 +3826,12 @@ async function pushRoom(idx, profile) {
       defConflict = true;
       continue;
     }
+
+    // Same "respect a deletion made elsewhere" rule as the slots section
+    // above: no match found, but this device previously confirmed this def
+    // really was saved (_syncedRecurDefIds) — someone else deleted it since;
+    // drop it here instead of resurrecting it from this device's stale copy.
+    if (!remote && syncedDefIds.has(d.id)) continue;
 
     const patch = buildDefPatch(d);
     patch.defTs = Date.now();
