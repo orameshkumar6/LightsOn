@@ -520,6 +520,14 @@
         <input class="settings-input" id="cfg-activate-window" type="number" min="0" placeholder="4" style="font-family:monospace;max-width:120px">
       </div>
     </div>
+    <div class="settings-section">
+      <div class="settings-title">Booking requests</div>
+      <div class="settings-sub" style="padding:0 14px 8px">Controls the public booking-request page (Settings → Booking request page QR code).</div>
+      <div class="settings-row">
+        <div class="settings-label">Auto-approve requests<div class="settings-sub">Off = every request waits in the Requests tab for you to confirm. On = a request is checked against current availability and confirmed immediately, with no review step.</div></div>
+        <input type="checkbox" id="cfg-auto-approve" style="width:20px;height:20px;accent-color:var(--accent)">
+      </div>
+    </div>
     <div class="settings-section admin-exempt">
       <div class="settings-title">End-of-slot warning</div>
       <div class="settings-sub admin-only" style="padding:0 14px 8px">A single shared beeper sounds one short beep when any room's active slot is a few minutes from ending, and that room's own LED starts blinking for the rest of the window. Leave both blank to disable — existing setups are unaffected. Applied to this profile's Firebase; the ESP32 needs a reboot to pick up a pin change.</div>
@@ -555,6 +563,18 @@
       <div style="display:flex;gap:8px">
         <button class="print-btn" onclick="showQR()" id="showQrBtn">🔍 Show QR code</button>
         <button class="print-btn" onclick="printQR()" style="display:none" id="printQrBtn">🖨️ Print</button>
+      </div>
+    </div>
+    <div class="qr-section">
+      <div class="settings-title" style="padding:0 0 8px">Booking request page QR code</div>
+      <div id="qrHidden2" style="display:none">
+        <div class="qr-url" id="qrProfileName2" style="font-weight:600;color:var(--text);margin-bottom:4px"></div>
+        <div class="qr-box"><div id="qrCanvas2"></div></div>
+        <div class="qr-url" id="qrUrlText2"></div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="print-btn" onclick="showRequestQR()" id="showQrBtn2">🔍 Show QR code</button>
+        <button class="print-btn" onclick="printRequestQR()" style="display:none" id="printQrBtn2">🖨️ Print</button>
       </div>
     </div>
     <div class="settings-section">
@@ -664,6 +684,15 @@
       </div>
     </div>
   </div>
+
+  <!-- Booking Requests (from the public request.html page) -->
+  <div class="page" id="page-requests">
+    <div class="settings-section">
+      <div class="settings-title">Booking requests</div>
+      <div class="settings-sub" style="padding:0 14px 8px">Today and tomorrow only — anything older is cleared automatically when this tab opens.</div>
+      <div id="requestsList"></div>
+    </div>
+  </div>
 </div>
 
 <div class="bottom-nav">
@@ -674,6 +703,10 @@
   <button class="nav-btn" id="nav-timeline" onclick="showPage('timeline',this)">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
     Timeline
+  </button>
+  <button class="nav-btn" id="nav-requests" onclick="showPage('requests',this)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+    Requests
   </button>
   <button class="nav-btn" id="nav-settings" onclick="showPage('settings',this)">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -729,6 +762,22 @@ function makeBlankRooms() {
 // Stable id for a recurring definition.
 function makeRecurDefId() {
   return 'rd_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+// Stable per-slot id. Every slot instance (one-time or materialized recurring)
+// gets one so activation can be matched by identity instead of array position —
+// the array reorders (recurring-first rematerialize, rollover) shift indices and
+// used to clobber/lose an activated slot's state. The id travels to Firebase as
+// an extra field (the ESP32 still reads slots by index and ignores it).
+function makeSlotId() {
+  return 'sl_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+// Defensive: ensure every slot in an array has an id (old data / imports predate
+// the id). Mutates in place and returns the array. Called on load, restore, and
+// after any normalizeSlots of stored/remote data.
+function ensureSlotIds(slots) {
+  if (Array.isArray(slots)) slots.forEach(sl => { if (sl && !sl.id) sl.id = makeSlotId(); });
+  return slots;
 }
 const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 
@@ -1357,6 +1406,7 @@ async function confirmBookingImport() {
 
   const code = generate4DigitCode();
   const slot = {
+    id: makeSlotId(),
     s: start, e: end, recurring: false, code,
     activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false,
     _fresh: true,
@@ -1973,6 +2023,7 @@ async function saveSlotFromModal() {
   // Firebase — set it here too so the dashboard shows it active immediately.
   const autoActivate = !slotCode;
   r.slots[modalDay].push({
+    id: makeSlotId(),
     s: s, e: e, recurring,
     code: slotCode,
     paid,
@@ -2361,6 +2412,322 @@ function showQR() {
   }
 }
 
+// Booking-request page QR — same lazy-generate-once pattern as showQR(),
+// just a separate flag/target so switching between the two QR sections
+// doesn't skip regenerating the one not yet shown.
+let reqQrGenerated = false;
+
+function showRequestQR() {
+  const p = getActiveProfile();
+  if (!p.dbUrl) { showToast('Set this profile\'s Database URL first, then Show QR'); return; }
+  if (!p.fbNum) { showToast('Save this profile first — its Firebase number hasn\'t been assigned yet'); return; }
+  const baseUrl = window.location.href
+    .replace('index.html', '')
+    .replace(/\/$/, '');
+  const requestUrl = baseUrl + '/request.html?db=' + encodeURIComponent(p.dbUrl) + '&p=' + p.fbNum;
+
+  document.getElementById('qrHidden2').style.display = 'block';
+  document.getElementById('showQrBtn2').style.display = 'none';
+  document.getElementById('printQrBtn2').style.display = 'block';
+  document.getElementById('qrProfileName2').textContent = p.name;
+  document.getElementById('qrUrlText2').textContent = requestUrl;
+
+  if (!reqQrGenerated) {
+    document.getElementById('qrCanvas2').innerHTML = '';
+    const tryGenerate = () => {
+      if (typeof QRCode === 'undefined') {
+        document.getElementById('qrCanvas2').innerHTML =
+          '<div style="color:var(--muted);font-size:12px;padding:10px">Loading QR library…</div>';
+        setTimeout(tryGenerate, 500);
+        return;
+      }
+      try {
+        document.getElementById('qrCanvas2').innerHTML = '';
+        new QRCode(document.getElementById('qrCanvas2'), {
+          text: requestUrl,
+          width: 160, height: 160,
+          colorDark: '#000000',
+          colorLight: '#ffffff',
+          correctLevel: QRCode.CorrectLevel.M
+        });
+        reqQrGenerated = true;
+      } catch(e) {
+        document.getElementById('qrCanvas2').innerHTML =
+          '<div style="color:var(--red);font-size:12px;padding:10px">QR library not loaded.<br>Check internet connection.</div>';
+      }
+    };
+    tryGenerate();
+  }
+}
+
+function printRequestQR() {
+  const p = getActiveProfile();
+  if (!p.dbUrl) { showToast('Set this profile\'s Database URL first'); return; }
+  if (!p.fbNum) { showToast('Save this profile first — its Firebase number hasn\'t been assigned yet'); return; }
+  const baseUrl = window.location.href.replace('index.html','').replace(/\/$/, '');
+  const requestUrl = baseUrl + '/request.html?db=' + encodeURIComponent(p.dbUrl) + '&p=' + p.fbNum;
+  const win = window.open('', '_blank');
+  const scriptTag = '<scr' + 'ipt src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></' + 'script>';
+  const inlineScript = '<scr' + 'ipt>window.onload=function(){new QRCode(document.getElementById("qr"),{text:"' + requestUrl + '",width:280,height:280,colorDark:"#000000",colorLight:"#ffffff",correctLevel:2});setTimeout(function(){window.print();},800);};</' + 'script>';
+  const productFooterHtml =
+    '<div style="margin-top:24px;font-size:12px;color:#999;line-height:1.6">' +
+    '<strong style="color:#666">' + PRODUCT_INFO.name + '</strong> — ' + PRODUCT_INFO.tagline + '<br>' +
+    PRODUCT_INFO.phone + ' &middot; ' + PRODUCT_INFO.email +
+    '</div>';
+  win.document.write(
+    '<!DOCTYPE html><html><head><title>' + PRODUCT_INFO.name + ' QR</title>' +
+    '<style>body{font-family:-apple-system,sans-serif;text-align:center;padding:40px;}' +
+    'h2{font-size:22px;margin-bottom:4px;}p{color:#666;font-size:14px;margin-bottom:20px;}' +
+    '@media print{button{display:none;}}</style>' +
+    scriptTag +
+    '</head><body>' +
+    '<h2>' + PRODUCT_INFO.name + ' — ' + p.name + '</h2>' +
+    '<p>Scan to request a booking</p>' +
+    '<div id="qr" style="display:inline-block;background:white;padding:12px;border:1px solid #ddd;border-radius:8px"></div>' +
+    productFooterHtml +
+    '<br><button onclick="window.print()">Print</button>' +
+    inlineScript +
+    '\n</body></html>'
+  );
+  win.document.close();
+}
+
+// ── Booking requests (from the public request.html page) ─────────────
+// /requests/{id} is written by request.html with no login — this is the
+// admin side: list, purge stale ones, convert to a real slot, or dismiss.
+let requestsCache = {}; // id -> request object, refreshed each renderRequests()
+
+async function renderRequests() {
+  const container = document.getElementById('requestsList');
+  container.innerHTML = '<div class="settings-sub" style="padding:10px 14px">Loading…</div>';
+  const p = getActiveProfile();
+  if (!p || !p.dbUrl) { container.innerHTML = '<div class="settings-sub" style="padding:10px 14px">Set a Firebase URL in Settings first.</div>'; return; }
+
+  const data = await fbGet('/requests', p);
+  requestsCache = (data && typeof data === 'object') ? data : {};
+
+  // Purge anything dated before today — regardless of status. Only ever
+  // reached when this tab is opened, not on every app load, so it doesn't
+  // add extra Firebase traffic to routine dashboard use.
+  const today = todayStr();
+  const staleIds = Object.keys(requestsCache).filter(id => {
+    const r = requestsCache[id];
+    return !r || !r.date || r.date < today;
+  });
+  if (staleIds.length > 0) {
+    await Promise.all(staleIds.map(id => fbSet(`/requests/${id}`, null, p)));
+    staleIds.forEach(id => delete requestsCache[id]);
+  }
+
+  const ids = Object.keys(requestsCache);
+  if (ids.length === 0) {
+    container.innerHTML = '<div class="settings-sub" style="padding:10px 14px">No booking requests for today or tomorrow.</div>';
+    return;
+  }
+
+  // Today's first, then tomorrow's; within each, earliest start time first.
+  ids.sort((a, b) => {
+    const ra = requestsCache[a], rb = requestsCache[b];
+    if (ra.date !== rb.date) return ra.date < rb.date ? -1 : 1;
+    return (ra.s || '').localeCompare(rb.s || '');
+  });
+
+  container.innerHTML = ids.map(id => {
+    const r = requestsCache[id];
+    const badges = {
+      confirmed: '<span class="status-msg ok" style="display:inline-block;margin:0">✓ Confirmed</span>',
+      declined:  '<span class="status-msg err" style="display:inline-block;margin:0">✗ Declined</span>',
+      open:      '<span class="status-msg" style="display:inline-block;margin:0;background:rgba(240,160,48,0.15);color:#f0a030">⏳ Open</span>',
+      taken:     '<span class="status-msg err" style="display:inline-block;margin:0">⚠ Slot taken</span>'
+    };
+    let status = (r.status === 'confirmed' || r.status === 'declined') ? r.status : 'open';
+    // An open request whose exact room+date+time is already occupied — by a
+    // direct admin booking, not necessarily this request's own conversion —
+    // can never be one-click-confirmed. Surface that up front instead of only
+    // discovering it when Confirm is tapped and fails.
+    if (status === 'open' && isSlotTaken(r)) status = 'taken';
+    const dayLabel = r.date === today ? 'Today' : 'Tomorrow';
+    const showConfirm = status === 'open' || status === 'taken';
+    const showEdit = status === 'open' || status === 'taken';
+    return `<div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px;border-bottom:1px solid var(--border);padding:12px 14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <div style="font-weight:600">${r.roomName || ('Room ' + r.roomId)} · ${r.s} – ${r.e} <span style="color:var(--muted);font-weight:400">(${dayLabel})</span></div>
+        ${badges[status]}
+      </div>
+      <div style="color:var(--muted);font-size:13px">${r.name || ''} · <a href="tel:${r.phone||''}" style="color:var(--accent);text-decoration:none">${r.phone||''}</a></div>
+      <div style="display:flex;gap:8px;margin-top:4px">
+        ${showConfirm ? `<button class="save-btn" style="margin:0;flex:1" onclick="convertRequest('${id}')">✓ Confirm booking</button>` : ''}
+        ${showEdit ? `<button class="test-btn" style="margin:0;flex:1" onclick="openEditRequestModal('${id}')">✎ Edit &amp; Confirm</button>` : ''}
+        <button class="profile-btn" onclick="dismissRequest('${id}')" title="Dismiss">🗑</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// True when this room already has a slot at this exact date/start/end —
+// e.g. the admin booked it directly (not via this request) while the
+// request sat open. A stale/missing room or a request no longer dated
+// today/tomorrow also counts as "taken" (nothing to confirm it against).
+function isSlotTaken(req) {
+  const room = state.rooms.find(r => r.id === req.roomId);
+  if (!room) return true;
+  const dayIdx = (req.date === todayStr()) ? 0 : (req.date === tomorrowDateStr() ? 1 : null);
+  if (dayIdx === null) return true;
+  return normalizeSlots(room.slots[dayIdx]).some(sl => sl.s === req.s && sl.e === req.e);
+}
+
+// Once a specific room+date+time is booked (by any means — admin convert
+// or the public page's auto-approve), every OTHER still-open request for
+// that exact same slot can never be honoured too — decline them so they
+// don't sit in the list looking actionable. excludeId is the request that
+// was just confirmed (or is being confirmed inline), so it's never
+// declined by its own conversion.
+async function declineSiblingRequests(confirmedReq, excludeId, p) {
+  const data = await fbGet('/requests', p);
+  if (!data || typeof data !== 'object') return;
+  const jobs = Object.keys(data)
+    .filter(rid => rid !== excludeId)
+    .filter(rid => {
+      const r = data[rid];
+      return r && r.status !== 'confirmed' && r.status !== 'declined' &&
+        r.roomId === confirmedReq.roomId && r.date === confirmedReq.date &&
+        r.s === confirmedReq.s && r.e === confirmedReq.e;
+    })
+    .map(rid => fbPatch(`/requests/${rid}`, { status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' }, p));
+  await Promise.all(jobs);
+}
+
+// Shared by the one-click Confirm and the Edit & Confirm modal: creates a
+// real, coded one-time slot for room/dayIdx/date/s/e, marks the request
+// confirmed and linked to it, and declines any other open request for that
+// exact final room/date/time. Returns {ok:false} without changing anything
+// if that room/time is already occupied — caller decides how to surface it.
+async function bookSlotForRequest(id, req, room, dayIdx, date, s, e, p) {
+  if (!room.slots[dayIdx]) room.slots[dayIdx] = [];
+  const existing = normalizeSlots(room.slots[dayIdx]);
+  if (existing.some(sl => sl.s === s && sl.e === e)) return { ok: false };
+
+  const newSlot = {
+    id: makeSlotId(),
+    s, e, recurring: false,
+    code: generate4DigitCode(),
+    paid: false,
+    activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false,
+    _fresh: true,
+    date,
+    bookedBy: req.name || null,
+    phone: req.phone || null
+  };
+  room.slots[dayIdx].push(newSlot);
+
+  markRoomDirty(room.id - 1);
+  persist();
+  await pushRoom(room.id - 1, p);
+  await fbPatch(`/requests/${id}`, {
+    status: 'confirmed',
+    confirmedAt: Date.now(),
+    confirmedRoomId: room.id,
+    confirmedSlotId: newSlot.id
+  }, p);
+  await declineSiblingRequests({ roomId: room.id, date, s, e }, id, p);
+
+  return { ok: true, room, slot: newSlot };
+}
+
+// One click: books using the request's own room/date/time verbatim, no
+// editing step.
+async function convertRequest(id) {
+  if (!requireLicense('convert a booking request')) return;
+  const req = requestsCache[id];
+  if (!req) { showToast('Request not found — try reloading this tab'); return; }
+  const room = state.rooms.find(r => r.id === req.roomId);
+  if (!room) { showToast('That room no longer exists'); return; }
+  const dayIdx = (req.date === todayStr()) ? 0 : (req.date === tomorrowDateStr() ? 1 : null);
+  if (dayIdx === null) { showToast('This request is no longer for today or tomorrow'); return; }
+
+  const p = getActiveProfile();
+  const result = await bookSlotForRequest(id, req, room, dayIdx, req.date, req.s, req.e, p);
+  if (!result.ok) {
+    showToast('⚠️ That room already has a slot at this time — use Edit & Confirm to pick another');
+    return;
+  }
+
+  showToast(`✓ Booking confirmed for ${result.room.name}`);
+  renderDashboard();
+  refreshTimelineIfVisible();
+  renderRequests();
+}
+
+// ── Edit & Confirm modal — adjust room/day/time before booking ─────────
+let editReqId = null;
+let editReqDay = 0;
+
+function editReqModalBackdropClick(e) { if (e.target.id === 'editRequestModal') closeEditRequestModal(); }
+
+function openEditRequestModal(id) {
+  if (!requireLicense('edit and confirm a booking request')) return;
+  const req = requestsCache[id];
+  if (!req) { showToast('Request not found — try reloading this tab'); return; }
+  editReqId = id;
+  const sel = document.getElementById('reqEditRoom');
+  sel.innerHTML = state.rooms.map(r => `<option value="${r.id}" ${r.id === req.roomId ? 'selected' : ''}>${r.name}</option>`).join('');
+  setReqEditDay(req.date === todayStr() ? 0 : 1);
+  document.getElementById('reqEditStart').value = req.s;
+  document.getElementById('reqEditEnd').value = req.e;
+  document.getElementById('reqEditError').style.display = 'none';
+  document.getElementById('editRequestModal').classList.add('show');
+}
+
+function setReqEditDay(day) {
+  editReqDay = day;
+  document.getElementById('reqEditDayToday').className = 'ov-btn' + (day === 0 ? ' active-auto' : '');
+  document.getElementById('reqEditDayTomorrow').className = 'ov-btn' + (day === 1 ? ' active-auto' : '');
+}
+
+function closeEditRequestModal() {
+  document.getElementById('editRequestModal').classList.remove('show');
+  editReqId = null;
+}
+
+function showEditReqError(msg) {
+  const el = document.getElementById('reqEditError');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+async function saveEditedRequest() {
+  const id = editReqId;
+  const req = requestsCache[id];
+  if (!req) return;
+  const roomId = parseInt(document.getElementById('reqEditRoom').value, 10);
+  const room = state.rooms.find(r => r.id === roomId);
+  if (!room) { showEditReqError('Room not found'); return; }
+  const s = document.getElementById('reqEditStart').value;
+  const e = document.getElementById('reqEditEnd').value;
+  if (!s || !e || s >= e) { showEditReqError('Invalid time range'); return; }
+  const date = editReqDay === 0 ? todayStr() : tomorrowDateStr();
+
+  const p = getActiveProfile();
+  const result = await bookSlotForRequest(id, req, room, editReqDay, date, s, e, p);
+  if (!result.ok) { showEditReqError('⚠️ That room already has a slot at this time — pick another'); return; }
+
+  closeEditRequestModal();
+  showToast(`✓ Booking confirmed for ${result.room.name}`);
+  renderDashboard();
+  refreshTimelineIfVisible();
+  renderRequests();
+}
+
+async function dismissRequest(id) {
+  if (!requireLicense('dismiss a booking request')) return;
+  if (!confirm('Delete this booking request? This cannot be undone.')) return;
+  const p = getActiveProfile();
+  await fbSet(`/requests/${id}`, null, p);
+  delete requestsCache[id];
+  showToast('Request dismissed');
+  renderRequests();
+}
+
 function printQR() {
   const p = getActiveProfile();
   if (!p.dbUrl) { showToast('Set this profile\'s Database URL first'); return; }
@@ -2533,8 +2900,8 @@ function hydrate() {
     state.rooms = Array.isArray(savedRooms) ? savedRooms : makeBlankRooms();
     state.rooms.forEach(r => {
       if (r.slots) {
-        r.slots[0] = normalizeSlots(r.slots[0]);
-        r.slots[1] = normalizeSlots(r.slots[1]);
+        r.slots[0] = ensureSlotIds(normalizeSlots(r.slots[0]));
+        r.slots[1] = ensureSlotIds(normalizeSlots(r.slots[1]));
         // Defensive init: slots saved before the payment feature have no `paid`
         // field — normalize to a real boolean (reads already coerce via !!, this
         // just keeps the stored data clean/consistent).
@@ -2907,6 +3274,11 @@ async function checkDailySlotRefresh(p) {
     state.rooms[idx].slots[0] = normalizeSlots(data[key] && data[key].slots);
     state.rooms[idx].slots[1] = normalizeSlots(data[key] && data[key].slotsT);
     state.rooms[idx].recurringDefs = normalizeSlots(data[key] && data[key].recurring);
+    // Firebase is authoritative here — refresh pushRoom()'s "what did I last
+    // confirm was in Firebase" baseline to match, so the next push's id-diff
+    // (see pushRoom) isn't comparing against a stale pre-refresh baseline.
+    state.rooms[idx]._syncedSlotIds = state.rooms[idx].slots[0].map(sl => sl && sl.id).filter(Boolean);
+    state.rooms[idx]._syncedRecurDefIds = state.rooms[idx].recurringDefs.map(d => d && d.id).filter(Boolean);
   });
   p.slotsRolloverMarker = marker;
   persist();
@@ -2976,6 +3348,7 @@ async function pullConfigFromFirebase(p) {
     const awh = (cfg.activateWindowHours === null || cfg.activateWindowHours === undefined || cfg.activateWindowHours === '') ? null : Math.max(0, parseInt(cfg.activateWindowHours, 10) || 0);
     setIf('activateWindowHours', awh);
   }
+  if ('autoApproveBookings' in cfg) setIf('autoApproveBookings', !!cfg.autoApproveBookings);
   if ('beeperPin' in cfg)    setIf('beeperPin',    numOrNull(cfg.beeperPin));
   if ('warnMinutes' in cfg)  setIf('warnMinutes',  numOrNull(cfg.warnMinutes));
   if ('beepMs' in cfg)       setIf('beepMs',       numOrNull(cfg.beepMs));
@@ -3069,6 +3442,10 @@ async function manualSyncFromFirebase(opts) {
       state.rooms[idx].slots[0] = normalizeSlots(remote.slots);
       state.rooms[idx].slots[1] = normalizeSlots(remote.slotsT);
       state.rooms[idx].recurringDefs = normalizeSlots(remote.recurring);
+      // Refresh pushRoom()'s "what did I last confirm was in Firebase"
+      // baseline to match this authoritative pull (see pushRoom's id-diff).
+      state.rooms[idx]._syncedSlotIds = state.rooms[idx].slots[0].map(sl => sl && sl.id).filter(Boolean);
+      state.rooms[idx]._syncedRecurDefIds = state.rooms[idx].recurringDefs.map(d => d && d.id).filter(Boolean);
       // MANUAL sync only: also pull the room's manual override (Force ON/OFF/
       // Auto) so a change made on another device shows here. The live SSE /
       // polling / on-load auto-sync paths intentionally DON'T do this (they
@@ -3197,55 +3574,118 @@ async function pushRoom(idx, profile) {
     updatedAt: Date.now()
   }, p) && ok;
 
-  // Write each today slot individually — only structural fields, not activation
+  // ── Slots (today) — merge by id, optimistic-lock by slotTs ───────────
+  // Every slot carries a stable `id` (makeSlotId(), never reused) and a
+  // `slotTs` that is written ONLY here, right before each write — never at
+  // creation/edit call sites — so it always holds "the value this device
+  // last confirmed was in Firebase" until the instant this function decides
+  // to overwrite it. That is what makes the comparison below meaningful.
+  //
+  // The previous version wrote this device's local array by POSITION, then
+  // deleted every Firebase index beyond the local array's length ("ghost
+  // prune"). That silently deleted slots another device had added after
+  // this device's last sync, any time this device's local copy was short —
+  // the root cause of the "slots vanished" bug. This version diffs by id
+  // instead of by count:
+  //   - local slot, no remote match  → brand new — create it.
+  //   - local slot, remote match, same slotTs → this device's edit is based
+  //     on the current value — write it, stamping a fresh slotTs.
+  //   - local slot, remote match, DIFFERENT slotTs → someone else changed
+  //     it since we last read it. Firebase wins: adopt its data locally,
+  //     discard this device's edit, flag a conflict (see below).
+  //   - remote slot with no local match, id already in `_syncedSlotIds`
+  //     (this device previously confirmed it existed) → this device
+  //     removed it locally (delete / rollover / rematerialize) → prune it.
+  //   - remote slot with no local match, id NOT in `_syncedSlotIds` →
+  //     another device added it since our last sync → keep it, adopt it.
   const todaySlots = normalizeSlots(r.slots[0]);
+  const existingSlotsRaw = await fbGet(`${roomBase}/slots`, p);
+  const remoteSlotsArr = normalizeSlots(existingSlotsRaw);
+  const remoteById = new Map();
+  remoteSlotsArr.forEach(sl => { if (sl && sl.id) remoteById.set(sl.id, sl); });
+  // Before this feature shipped, /slots never carried an id at all — so on
+  // the FIRST push after upgrading, every remote slot in a room still looks
+  // "unmatched" even though it's the very slot a local entry represents.
+  // Correlate by position for this one transitional push only (matching the
+  // old behavior exactly), so nothing gets written twice. From the next push
+  // on, every slot has an id and this fallback never triggers again.
+  const noRemoteIdsYet = remoteSlotsArr.length > 0 && remoteById.size === 0;
+  const syncedSlotIds = new Set(Array.isArray(r._syncedSlotIds) ? r._syncedSlotIds : []);
+
+  let slotConflict = false;
+  const finalSlots = [];
+  const slotPatches = [];
+  const placedIds = new Set();
+  const consumedRemote = new Set(); // remote slot objects already matched to a local one
+
+  const buildSlotPatch = (sl) => ({
+    id: sl.id, slotTs: sl.slotTs,
+    s: sl.s, e: sl.e,
+    recurring: sl.recurring,
+    code: sl.code,
+    date: sl.date,
+    // Booker name/phone — must be written so activate.html can show the
+    // booked-under name against each slot and the WhatsApp reminder works.
+    bookedBy: sl.bookedBy || null,
+    phone: sl.phone || null,
+    // Payment status (paid/unpaid) — written so it survives sync and shows
+    // on other devices. Default false when absent.
+    paid: !!sl.paid,
+    // Per-slot recurring weekday set (0=Sun..6=Sat) — written so the day-of-
+    // week recurrence persists and reaches the ESP32. null for non-recurring
+    // slots or recurring slots with no restriction (runs every day).
+    days: (sl.recurring && Array.isArray(sl.days) && sl.days.length) ? sl.days : null,
+    // For a slot this device isn't actively writing (a foreign addition, or
+    // one just adopted from a conflict) this mirrors whatever Firebase
+    // already has — see the explicit override below for this device's own
+    // writes, which always clear a stale expired flag.
+    expired: !!sl.expired
+    // activatedAt/By/attempts/lockedUntil NOT written here — managed
+    // exclusively by activateSlot/deactivateSlot/activate.html, and
+    // blanket-resetting them on every save would turn off a light someone
+    // just legitimately activated if the owner edits a sibling slot in the
+    // same room around the same time.
+  });
+
   for (let si = 0; si < todaySlots.length; si++) {
     const sl = todaySlots[si];
-    const patch = {
-      s: sl.s, e: sl.e,
-      recurring: sl.recurring,
-      code: sl.code,
-      date: sl.date,
-      // Booker name/phone — must be written so activate.html can show the
-      // booked-under name against each slot and the WhatsApp reminder works.
-      // Omitting them (as this patch used to) left bookedBy undefined in
-      // Firebase, so the activation page never displayed it. null clears the
-      // field for a slot with no booker rather than leaving a stale value.
-      bookedBy: sl.bookedBy || null,
-      phone: sl.phone || null,
-      // Payment status (paid/unpaid) — written so it survives sync and shows
-      // on other devices. Default false when absent.
-      paid: !!sl.paid,
-      // Per-slot recurring weekday set (0=Sun..6=Sat) — written so the day-of-
-      // week recurrence persists and reaches the ESP32. null for non-recurring
-      // slots or recurring slots with no restriction (runs every day).
-      days: (sl.recurring && Array.isArray(sl.days) && sl.days.length) ? sl.days : null,
-      // expired IS explicitly reset here (unlike activatedAt/attempts/
-      // lockedUntil, which stay ESP32/activate.html-owned) — PATCH only
-      // touches fields it's given, so without this a slot that reuses a
-      // Firebase index a past, unactivated booking already expired (e.g.
-      // a recurring slot hitting the same index every day, or a fresh
-      // slot created after an old one was deleted) silently inherits
-      // that stale expired:true forever. Safe to always clear: any slot
-      // still in r.slots[0] that's genuinely past its end time is already
-      // hidden from activate.html's own "not yet ended" filter regardless
-      // of this flag, so there's nothing visible to regress.
-      expired: false
-      // activatedAt/By/attempts/lockedUntil NOT written here on every
-      // push — managed exclusively by activateSlot/deactivateSlot/
-      // activate.html, and blanket-resetting them on every save would
-      // turn off a light someone just legitimately activated if the
-      // owner edits a sibling slot in the same room around the same time.
-    };
-    // A BRAND NEW slot is the one case those fields must still be reset:
+    if (!sl.id) sl.id = makeSlotId();
+    let remote = remoteById.get(sl.id);
+    if (!remote && noRemoteIdsYet) {
+      const positional = remoteSlotsArr[si];
+      if (positional && !positional.id) remote = positional;
+    }
+    if (remote) consumedRemote.add(remote);
+
+    if (remote && typeof remote.slotTs === 'number' && typeof sl.slotTs === 'number' && remote.slotTs !== sl.slotTs) {
+      // Someone else updated this slot since we last read it — Firebase
+      // wins. Adopt its data locally instead of overwriting it with our
+      // stale edit; the user has to redo their change after a Sync.
+      Object.assign(sl, remote);
+      finalSlots.push(sl);
+      slotPatches.push(buildSlotPatch(sl));
+      placedIds.add(sl.id);
+      slotConflict = true;
+      continue;
+    }
+
+    const patch = buildSlotPatch(sl);
+    patch.slotTs = Date.now();
+    // expired IS explicitly reset here (unlike activatedAt/attempts/
+    // lockedUntil, which stay ESP32/activate.html-owned) — PATCH only
+    // touches fields it's given, so without this a slot that reuses a
+    // Firebase index a past, unactivated booking already expired (e.g. a
+    // fresh slot created after an old one was deleted) silently inherits
+    // that stale expired:true forever. Safe to always clear here: any slot
+    // still in r.slots[0] that's genuinely past its end time is already
+    // hidden from activate.html's own "not yet ended" filter regardless of
+    // this flag, so there's nothing visible to regress.
+    patch.expired = false;
+    // A BRAND NEW slot is the one case activation fields must be (re)seeded:
     // otherwise it silently inherits whatever activatedAt/attempts/
-    // lockedUntil a previous, unrelated booking left behind at this same
-    // Firebase index (e.g. a slot created after an old one was deleted,
-    // or a second overlapping slot landing on an index a now-finished
-    // earlier slot had already activated) — the ESP32 then reads that
-    // stale activatedAt and switches the relay on for a slot no one
-    // actually activated. _fresh is set only at creation and cleared
-    // right after this first push, so later edits never re-trigger it.
+    // lockedUntil a previous, unrelated booking left behind. _fresh is set
+    // only at creation and cleared right after this first push, so later
+    // edits never re-trigger it.
     if (sl._fresh) {
       // A no-code ("Auto") slot is active by default: seed activatedAt so the
       // relay comes on for its window and the dashboard shows it "✓ Active"
@@ -3267,29 +3707,46 @@ async function pushRoom(idx, profile) {
                  // before the next push would resurrect it and reset
                  // activation state again on some later, unrelated save
     }
-    ok = await fbPatch(`${roomBase}/slots/${si}`, patch, p) && ok;
+    sl.slotTs = patch.slotTs;
+    finalSlots.push(sl);
+    slotPatches.push(patch);
+    placedIds.add(sl.id);
   }
 
-  // Prune ghost slot entries left behind when the array shrinks (e.g.
-  // after deleting a slot) — the loop above only ever PATCHes indices
-  // still in use, so anything beyond today's count would otherwise sit
-  // in Firebase forever, get picked up by the ESP32's blind index scan,
-  // and reappear on the next pull-sync.
-  //
-  // IMPORTANT: Firebase RTDB serves contiguous 0,1,2,… keys back as a JSON
-  // ARRAY, not an object, so an earlier `!Array.isArray` guard here skipped
-  // pruning in the normal case and let deleted slots resurrect. Handle both
-  // shapes — Object.keys() gives "0","1",… for an array too — and null out
-  // every index at or beyond the current count.
-  const existingSlots = await fbGet(`${roomBase}/slots`, p);
-  if (existingSlots && typeof existingSlots === 'object') {
-    for (const key of Object.keys(existingSlots)) {
+  // Remote slots this device never matched to a local one: keep the ones no
+  // one told us about yet (another device's addition — including one this
+  // device's own stale array is simply missing), drop the ones this device
+  // knows it removed.
+  remoteSlotsArr.forEach(remote => {
+    if (!remote || consumedRemote.has(remote)) return;
+    if (!remote.id) remote.id = makeSlotId();               // migrate legacy, id-less data
+    if (typeof remote.slotTs !== 'number') remote.slotTs = Date.now();
+    if (placedIds.has(remote.id)) return;
+    if (syncedSlotIds.has(remote.id)) return; // known + now locally absent → intentional delete
+    finalSlots.push(remote);
+    slotPatches.push(buildSlotPatch(remote));
+    placedIds.add(remote.id);
+  });
+
+  // Write the merged, deduped set back as a fresh compact 0..N-1 array so the
+  // ESP32's positional read keeps working unchanged, then prune anything
+  // left over in Firebase beyond this length (same technique as before, but
+  // the cutoff now reflects every slot that legitimately belongs — including
+  // ones this device didn't create — so it can never eat another device's
+  // addition again).
+  for (let i = 0; i < finalSlots.length; i++) {
+    ok = await fbPatch(`${roomBase}/slots/${i}`, slotPatches[i], p) && ok;
+  }
+  if (existingSlotsRaw && typeof existingSlotsRaw === 'object') {
+    for (const key of Object.keys(existingSlotsRaw)) {
       const ghostIdx = parseInt(key, 10);
-      if (!isNaN(ghostIdx) && ghostIdx >= todaySlots.length) {
+      if (!isNaN(ghostIdx) && ghostIdx >= finalSlots.length) {
         ok = await fbSet(`${roomBase}/slots/${ghostIdx}`, null, p) && ok;
       }
     }
   }
+  r.slots[0] = finalSlots;
+  r._syncedSlotIds = finalSlots.map(sl => sl.id).filter(Boolean);
 
   // Write slotsT (tomorrow) — these are never activated so safe to write fully.
   // days IS included now so a recurring slot seeded into tomorrow keeps its
@@ -3303,41 +3760,105 @@ async function pushRoom(idx, profile) {
   }));
   ok = await fbPatch(roomBase, { slotsT }, p) && ok;
 
-  // Write the authoritative recurring DEFINITIONS to /rooms/roomN/recurring.
-  // These are the source of truth for what recurs; the ESP32 and PWA rollover
-  // generate day buckets from them. Written wholesale like slotsT (defs never
-  // carry live activation state). Per-index write + ghost-prune so a removed
-  // def actually disappears in Firebase (same technique as the slots prune).
+  // ── Recurring definitions — merge by id, optimistic-lock by defTs ─────
+  // /rooms/roomN/recurring is the source of truth for what recurs; the ESP32
+  // and PWA rollover generate day buckets from it. Same id/timestamp merge
+  // scheme as the slots section above (defs already carried an `id`, so the
+  // "legacy, id-less data" fallback below is a defensive no-op in practice
+  // rather than the everyday case slots hit on the first post-upgrade push).
   const defs = Array.isArray(r.recurringDefs) ? r.recurringDefs : [];
+  const existingDefsRaw = await fbGet(`${roomBase}/recurring`, p);
+  const remoteDefsArr = normalizeSlots(existingDefsRaw);
+  const remoteDefById = new Map();
+  remoteDefsArr.forEach(d => { if (d && d.id) remoteDefById.set(d.id, d); });
+  const noRemoteDefIdsYet = remoteDefsArr.length > 0 && remoteDefById.size === 0;
+  const syncedDefIds = new Set(Array.isArray(r._syncedRecurDefIds) ? r._syncedRecurDefIds : []);
+
+  let defConflict = false;
+  const finalDefs = [];
+  const defPatches = [];
+  const placedDefIds = new Set();
+  const consumedRemoteDefs = new Set();
+
+  const buildDefPatch = (d) => ({
+    id: d.id, defTs: d.defTs,
+    s: d.s, e: d.e,
+    days: (Array.isArray(d.days) && d.days.length) ? d.days : null,
+    code: d.code || null,
+    bookedBy: d.bookedBy || null,
+    phone: d.phone || null,
+    paid: !!d.paid
+  });
+
   for (let di = 0; di < defs.length; di++) {
     const d = defs[di];
-    ok = await fbPatch(`${roomBase}/recurring/${di}`, {
-      id: d.id, s: d.s, e: d.e,
-      days: (Array.isArray(d.days) && d.days.length) ? d.days : null,
-      code: d.code || null,
-      bookedBy: d.bookedBy || null,
-      phone: d.phone || null,
-      paid: !!d.paid
-    }, p) && ok;
+    if (!d.id) d.id = makeRecurDefId();
+    let remote = remoteDefById.get(d.id);
+    if (!remote && noRemoteDefIdsYet) {
+      const positional = remoteDefsArr[di];
+      if (positional && !positional.id) remote = positional;
+    }
+    if (remote) consumedRemoteDefs.add(remote);
+
+    if (remote && typeof remote.defTs === 'number' && typeof d.defTs === 'number' && remote.defTs !== d.defTs) {
+      // Someone else edited this recurring definition since we last read it —
+      // Firebase wins; discard this device's edit and adopt the remote copy.
+      Object.assign(d, remote);
+      finalDefs.push(d);
+      defPatches.push(buildDefPatch(d));
+      placedDefIds.add(d.id);
+      defConflict = true;
+      continue;
+    }
+
+    const patch = buildDefPatch(d);
+    patch.defTs = Date.now();
+    d.defTs = patch.defTs;
+    finalDefs.push(d);
+    defPatches.push(patch);
+    placedDefIds.add(d.id);
   }
-  const existingDefs = await fbGet(`${roomBase}/recurring`, p);
-  if (existingDefs && typeof existingDefs === 'object') {
-    for (const key of Object.keys(existingDefs)) {
+
+  remoteDefsArr.forEach(remote => {
+    if (!remote || consumedRemoteDefs.has(remote)) return;
+    if (!remote.id) remote.id = makeRecurDefId();
+    if (typeof remote.defTs !== 'number') remote.defTs = Date.now();
+    if (placedDefIds.has(remote.id)) return;
+    if (syncedDefIds.has(remote.id)) return; // known + now locally absent → intentional delete
+    finalDefs.push(remote);
+    defPatches.push(buildDefPatch(remote));
+    placedDefIds.add(remote.id);
+  });
+
+  for (let i = 0; i < finalDefs.length; i++) {
+    ok = await fbPatch(`${roomBase}/recurring/${i}`, defPatches[i], p) && ok;
+  }
+  if (existingDefsRaw && typeof existingDefsRaw === 'object') {
+    for (const key of Object.keys(existingDefsRaw)) {
       const gi = parseInt(key, 10);
-      if (!isNaN(gi) && gi >= defs.length) {
+      if (!isNaN(gi) && gi >= finalDefs.length) {
         ok = await fbSet(`${roomBase}/recurring/${gi}`, null, p) && ok;
       }
     }
   }
+  r.recurringDefs = finalDefs;
+  r._syncedRecurDefIds = finalDefs.map(d => d.id).filter(Boolean);
 
-  // Clear the dirty marker only on a fully-successful push — otherwise leave
-  // it set so the next Sync retries this room. Persist so the flag survives
-  // a reload (an edit made offline stays "uncommitted" until it uploads).
-  if (ok && r._dirty) { delete r._dirty; persist(); }
+  const conflict = slotConflict || defConflict;
+  // A conflict means we discarded this device's own edit and adopted
+  // Firebase's version instead — there's nothing left of this device's
+  // change to retry, so that part of the room is "clean" even though the
+  // edit itself didn't survive.
+  if ((ok || conflict) && r._dirty) { delete r._dirty; persist(); }
+
+  if (conflict) {
+    addLog('error', `room${r.id}: a slot/recurring change was overwritten elsewhere — this device's edit was NOT saved; Sync and try again`);
+    showToast('⚠️ ' + (r.name || ('Room ' + r.id)) + ': someone else changed this — Sync and try again');
+  }
 
   addLog(ok ? 'ok' : 'error', `room${r.id} → Firebase`);
   setConnStatus(ok);
-  return ok;
+  return ok && !conflict;
 }
 
 // ── Manual slot rollover — same rule as the ESP32's midnightRollover() ──
@@ -3401,6 +3922,7 @@ function harvestRecurringDefs(r) {
 // resets activation (fresh instance for a new day).
 function materializeRecurringSlot(def, dateStr) {
   return {
+    id: makeSlotId(),
     s: def.s, e: def.e,
     recurring: true,
     defId: def.id,
@@ -3433,9 +3955,25 @@ function rolloverRoomLocally(r) {
   // ── Build new TODAY ────────────────────────────────────────
   // 1. Regenerate every recurring DEFINITION that runs on the new today's
   //    weekday — from recurringDefs (the source of truth), NOT from buckets.
+  //    If this same occurrence was already activated in the PRE-rollover
+  //    tomorrow bucket (e.g. someone used the activation page's lookahead
+  //    window to activate it before midnight), carry that activation
+  //    forward instead of resetting it — rollover relabels the day, it
+  //    isn't a new booking. Matched by defId, falling back to s+e (same
+  //    fallback deleteRecurringDef() uses) for an instance materialized by
+  //    firmware that predates the defId field.
   const regenToday = defs
     .filter(def => recurringRunsOnDay(def, newTodayWd))
-    .map(def => materializeRecurringSlot(def, todayDateStr));
+    .map(def => {
+      const fresh = materializeRecurringSlot(def, todayDateStr);
+      const preActivated = tomorrowSlots.find(sl => sl.recurring && sl.activatedAt &&
+        (sl.defId === def.id || (!sl.defId && sl.s === def.s && sl.e === def.e)));
+      if (preActivated) {
+        fresh.activatedAt = preActivated.activatedAt;
+        fresh.activatedBy = preActivated.activatedBy;
+      }
+      return fresh;
+    });
   // 2. Keep today's own one-time slots that are genuinely still today
   //    (created after an earlier rollover today) — untouched, activation kept.
   const keptOneTimeToday = todaySlots.filter(sl => !sl.recurring && sl.date === todayDateStr);
@@ -3624,9 +4162,35 @@ async function addSlot(id) {
 async function deleteSlot(id, idx) {
   if (!requireLicense('delete a slot')) return;
   const r = state.rooms.find(x => x.id === id);
+  const deletedSlot = normalizeSlots(r.slots[state.schedDay])[idx];
   r.slots[state.schedDay].splice(idx, 1);
   markRoomDirty(id-1);
   persist(); await pushRoom(id-1); renderDashboard(); refreshTimelineIfVisible();
+  if (deletedSlot && deletedSlot.id) await revertRequestForDeletedSlot(id, deletedSlot.id, getActiveProfile());
+}
+
+// Deleting a slot that came from a confirmed booking request leaves that
+// request pointing at a slot that no longer exists. Put it back to "open"
+// so it's visible/actionable in the Requests tab again — this is a plain
+// status revert, NOT a re-run of any booking/auto-approve workflow, so it
+// never creates a new slot or touches any other request on its own.
+async function revertRequestForDeletedSlot(roomId, slotId, p) {
+  const data = await fbGet('/requests', p);
+  if (!data || typeof data !== 'object') return;
+  const matchId = Object.keys(data).find(rid => {
+    const r = data[rid];
+    return r && r.status === 'confirmed' && r.confirmedRoomId === roomId && r.confirmedSlotId === slotId;
+  });
+  if (!matchId) return;
+  await fbPatch(`/requests/${matchId}`, {
+    status: 'open',
+    confirmedRoomId: null,
+    confirmedSlotId: null,
+    confirmedAt: null,
+    revertedAt: Date.now(),
+    revertedReason: 'slot_deleted'
+  }, p);
+  if (requestsCache[matchId]) requestsCache[matchId] = { ...requestsCache[matchId], status: 'open', confirmedRoomId: null, confirmedSlotId: null, confirmedAt: null };
 }
 
 function toggleDay(id, day) {
@@ -3914,6 +4478,7 @@ async function copySlots(fromId) {
       const startIdx = normalizeSlots(toRoom.slots[0]).length;
       const newSlots = day0slots.map(sl => ({
         ...sl,
+        id: makeSlotId(),            // fresh id — the copy is a distinct slot
         code: generate4DigitCode(),  // fresh code per room
         activatedAt: null,           // reset activation
         activatedBy: null,
@@ -3932,6 +4497,7 @@ async function copySlots(fromId) {
       if (!toRoom.slots[1]) toRoom.slots[1] = [];
       tomorrowSlots.forEach(sl => toRoom.slots[1].push({
         ...sl,
+        id: makeSlotId(),            // fresh id — the copy is a distinct slot
         code: generate4DigitCode(),  // fresh code per room
         activatedAt: null,
         activatedBy: null,
@@ -4342,6 +4908,7 @@ function renderSettings() {
   document.getElementById('cfg-emergency-pin').value = (p.emergencyPin === null || p.emergencyPin === undefined) ? '' : p.emergencyPin;
   document.getElementById('cfg-emergency-timeout').value = (p.emergencyTimeout === null || p.emergencyTimeout === undefined) ? '' : p.emergencyTimeout;
   document.getElementById('cfg-activate-window').value = (p.activateWindowHours === null || p.activateWindowHours === undefined) ? '' : p.activateWindowHours;
+  document.getElementById('cfg-auto-approve').checked = !!p.autoApproveBookings;
   document.getElementById('cfg-beeper-pin').value = (p.beeperPin === null || p.beeperPin === undefined) ? '' : p.beeperPin;
   document.getElementById('cfg-warn-minutes').value = (p.warnMinutes === null || p.warnMinutes === undefined) ? '' : p.warnMinutes;
   document.getElementById('cfg-beep-ms').value = (p.beepMs === null || p.beepMs === undefined) ? '' : p.beepMs;
@@ -4506,6 +5073,10 @@ function resetConnectionForProfileChange() {
   document.getElementById('qrHidden').style.display = 'none';
   document.getElementById('showQrBtn').style.display = 'block';
   document.getElementById('printQrBtn').style.display = 'none';
+  reqQrGenerated = false;
+  document.getElementById('qrHidden2').style.display = 'none';
+  document.getElementById('showQrBtn2').style.display = 'block';
+  document.getElementById('printQrBtn2').style.display = 'none';
 }
 
 async function saveActiveProfile() {
@@ -4536,6 +5107,7 @@ async function saveActiveProfile() {
   const activateWindowRaw = document.getElementById('cfg-activate-window').value.trim();
   const activateWindowVal = parseInt(activateWindowRaw, 10);
   p.activateWindowHours = activateWindowRaw === '' || isNaN(activateWindowVal) || activateWindowVal < 0 ? null : activateWindowVal;
+  p.autoApproveBookings = document.getElementById('cfg-auto-approve').checked;
   const beeperPinVal = document.getElementById('cfg-beeper-pin').value.trim();
   p.beeperPin = beeperPinVal === '' ? null : parseInt(beeperPinVal, 10);
   // Blank or 0 (or anything non-positive) disables the warning — store null
@@ -4637,6 +5209,7 @@ function finishSaveSettings(p, message) {
     fbSet('/config/emergencyPin', p.emergencyPin === null || p.emergencyPin === undefined ? null : p.emergencyPin, p);
     fbSet('/config/emergencyTimeout', p.emergencyTimeout === null || p.emergencyTimeout === undefined ? null : p.emergencyTimeout, p);
     fbSet('/config/activateWindowHours', p.activateWindowHours === null || p.activateWindowHours === undefined ? null : p.activateWindowHours, p);
+    fbSet('/config/autoApproveBookings', !!p.autoApproveBookings, p);
     fbSet('/config/beeperPin', p.beeperPin === null || p.beeperPin === undefined ? null : p.beeperPin, p);
     fbSet('/config/warnMinutes', p.warnMinutes === null || p.warnMinutes === undefined ? null : p.warnMinutes, p);
     fbSet('/config/beepMs', p.beepMs === null || p.beepMs === undefined ? null : p.beepMs, p);
@@ -4828,6 +5401,7 @@ function restoreFromFile(event) {
         if (!('emergencyPin' in p)) p.emergencyPin = null;
         if (!('emergencyTimeout' in p)) p.emergencyTimeout = null;
         if (!('activateWindowHours' in p)) p.activateWindowHours = null;
+        if (!('autoApproveBookings' in p)) p.autoApproveBookings = false;
         if (!('beeperPin' in p))    p.beeperPin = null;
         // warn/beep default to sensible values (not null) for old backups that
         // predate these fields — matches the new-profile defaults.
@@ -4846,8 +5420,8 @@ function restoreFromFile(event) {
       state.rooms = Array.isArray(savedRooms) ? savedRooms : makeBlankRooms();
       state.rooms.forEach(r => {
         if (r.slots) {
-          r.slots[0] = normalizeSlots(r.slots[0]);
-          r.slots[1] = normalizeSlots(r.slots[1]);
+          r.slots[0] = ensureSlotIds(normalizeSlots(r.slots[0]));
+          r.slots[1] = ensureSlotIds(normalizeSlots(r.slots[1]));
           // Normalize payment flag on restored slots (old backups lack it).
           r.slots[0].forEach(sl => { sl.paid = !!sl.paid; });
           r.slots[1].forEach(sl => { sl.paid = !!sl.paid; });
@@ -4968,6 +5542,7 @@ function showPage(name, btn) {
   if (name === 'timeline')  renderTimeline();
   if (name === 'settings')  renderSettings();
   if (name === 'import')    renderImportPage();
+  if (name === 'requests')  renderRequests();
 }
 
 // ── Toast ─────────────────────────────────────────────────────
@@ -5397,6 +5972,38 @@ function applyUpdate() {
         <button class="modal-save-btn" onclick="payChoiceSelect('send')">✓ Confirm &amp; Send WhatsApp</button>
         <button class="modal-cancel-btn" onclick="payChoiceSelect('update')">Update only (no message)</button>
         <button class="modal-cancel-btn" onclick="payChoiceSelect('cancel')">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Edit & Confirm booking request modal ─────────────────── -->
+  <div class="modal-overlay" id="editRequestModal" onclick="editReqModalBackdropClick(event)">
+    <div class="modal-box">
+      <div class="modal-header">
+        <span class="modal-title">Edit &amp; Confirm Booking</span>
+        <button class="modal-close" onclick="closeEditRequestModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-row">
+          <div class="modal-label">Room</div>
+          <select class="modal-time" id="reqEditRoom" style="flex:1"></select>
+        </div>
+        <div class="modal-adjust-row">
+          <button class="ov-btn" id="reqEditDayToday" onclick="setReqEditDay(0)">Today</button>
+          <button class="ov-btn" id="reqEditDayTomorrow" onclick="setReqEditDay(1)">Tomorrow</button>
+        </div>
+        <div class="modal-row">
+          <div class="modal-label">Start</div>
+          <input class="modal-time" type="time" id="reqEditStart">
+        </div>
+        <div class="modal-row">
+          <div class="modal-label">End</div>
+          <input class="modal-time" type="time" id="reqEditEnd">
+        </div>
+        <div class="status-msg err" id="reqEditError" style="display:none"></div>
+        <div class="modal-divider"></div>
+        <button class="modal-save-btn" onclick="saveEditedRequest()">✓ Confirm booking</button>
+        <button class="modal-cancel-btn" onclick="closeEditRequestModal()">Cancel</button>
       </div>
     </div>
   </div>

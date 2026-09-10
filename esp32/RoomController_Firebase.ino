@@ -141,6 +141,12 @@ struct RecurDef {
   char code[6];      // "" = auto-approved (no code)
   char bookedBy[24];
   char phone[20];
+  char defId[24];    // matches the PWA's makeRecurDefId() — "" if this def
+                      // predates the id field. Stamped onto every day-bucket
+                      // instance materialized from it (see buildDefSlotJson)
+                      // so rollover can recognize "the same occurrence" across
+                      // the tomorrow→today relabeling and carry its activation
+                      // forward instead of resetting it.
 };
 
 struct Room {
@@ -467,6 +473,7 @@ void parseRecurDefs(int idx, String json) {
       String c  = extractStringField(obj, "code");  c.toCharArray(d.code, sizeof(d.code));
       String bb = extractStringField(obj, "bookedBy"); bb.toCharArray(d.bookedBy, sizeof(d.bookedBy));
       String ph = extractStringField(obj, "phone");    ph.toCharArray(d.phone, sizeof(d.phone));
+      String di = extractStringField(obj, "id");       di.toCharArray(d.defId, sizeof(d.defId));
       rooms[idx].recurDefCount++;
     }
     pos = max(si, ei) + 10;
@@ -850,6 +857,68 @@ String extractStringField(const String &json, const String &field) {
   return json.substring(start, end);
 }
 
+// Extracts a field's raw (unquoted) value — a number, null, true/false — from
+// a JSON object substring, e.g. extractRawField(obj, "activatedAt") on
+// {"activatedAt":1690000000123,...} returns "1690000000123". Returns "" if
+// the field is missing. Unlike extractStringField, the value isn't
+// necessarily a plain string, so this is used only where the raw JSON value
+// is meant to be re-embedded verbatim (see findActivatedRecurringInstance).
+String extractRawField(const String &json, const String &field) {
+  String key = "\"" + field + "\":";
+  int idx = json.indexOf(key);
+  if (idx < 0) return "";
+  int start = idx + key.length();
+  int endComma = json.indexOf(',', start);
+  int endBrace = json.indexOf('}', start);
+  int end = (endComma < 0) ? endBrace : (endBrace < 0 ? endComma : min(endComma, endBrace));
+  if (end < 0) return "";
+  return json.substring(start, end);
+}
+
+// Scans a bucket's raw slots JSON (e.g. the pre-rollover /slotsT, fetched
+// BEFORE it gets overwritten) for a recurring instance matching the given
+// def — by defId when both sides have one, else falling back to matching by
+// start+end time (same fallback the PWA's deleteRecurringDef() already uses,
+// since an instance materialized before the defId field existed carries
+// none). Returns true and fills outActivatedAtRaw/outActivatedBy only when a
+// match is found AND it's actually activated (activatedAt present and not
+// null) — a rollover relabels an existing occurrence from "tomorrow" to
+// "today", it isn't a new booking, so an activation already granted for it
+// shouldn't be undone just because the calendar date changed under it.
+bool findActivatedRecurringInstance(const String &bucketJson, const String &defId,
+                                     const String &sStr, const String &eStr,
+                                     String &outActivatedAtRaw, String &outActivatedBy) {
+  if (bucketJson == "null" || bucketJson == "" || bucketJson == "error" || bucketJson.length() < 5) return false;
+  int pos = 0;
+  while (pos < (int)bucketJson.length()) {
+    int si = bucketJson.indexOf("\"s\":\"", pos);
+    int ei = bucketJson.indexOf("\"e\":\"", pos);
+    if (si < 0 || ei < 0) break;
+    int objStart = bucketJson.lastIndexOf('{', si);
+    int objEnd   = bucketJson.indexOf('}', ei);
+    if (objStart < 0 || objEnd < 0) { pos = max(si, ei) + 10; continue; }
+    String obj = bucketJson.substring(objStart, objEnd + 1);
+    pos = objEnd + 1;
+
+    if (obj.indexOf("\"recurring\":true") < 0) continue; // one-time slot — not what we're matching
+
+    String objDefId = extractStringField(obj, "defId");
+    bool matched = (defId.length() > 0 && objDefId == defId) ||
+                   (objDefId.length() == 0 &&
+                    bucketJson.substring(si + 5, si + 10) == sStr &&
+                    bucketJson.substring(ei + 5, ei + 10) == eStr);
+    if (!matched) continue;
+
+    bool hasActivatedField = obj.indexOf("\"activatedAt\":") >= 0;
+    bool activatedIsNull   = obj.indexOf("\"activatedAt\":null") >= 0;
+    if (!hasActivatedField || activatedIsNull) return false; // matched, but not activated — nothing to carry
+    outActivatedAtRaw = extractRawField(obj, "activatedAt");
+    outActivatedBy    = extractStringField(obj, "activatedBy");
+    return true;
+  }
+  return false;
+}
+
 // ── Midnight rollover — runs once when date changes ───────────
 // Rule:
 //   Recurring slots → today only, stay forever, never in tomorrow
@@ -969,26 +1038,47 @@ String buildRecurringSlotJson(int roomIdx, int j, const String &base, const Stri
 
 // Materialize a recurring DEFINITION (rooms[roomIdx].recurDefs[k]) into a
 // day-slot JSON object dated dateStr. Carries the def's stable code + booker/
-// phone + days, activation reset. This is the def-driven replacement for
-// buildRecurringSlotJson during rollover.
-String buildDefSlotJson(int roomIdx, int k, const String &dateStr) {
+// phone + days + defId, activation reset by default. This is the def-driven
+// replacement for buildRecurringSlotJson during rollover.
+//
+// overrideActivatedAtRaw/overrideActivatedBy let a caller carry an existing
+// activation forward instead of resetting it — used when rollover finds this
+// same occurrence was already activated in the bucket it's being promoted
+// FROM (see findActivatedRecurringInstance in midnightRollover). Leave both
+// empty for the normal reset-on-materialize behavior.
+String buildDefSlotJson(int roomIdx, int k, const String &dateStr,
+                         const String &overrideActivatedAtRaw, const String &overrideActivatedBy) {
   RecurDef &d = rooms[roomIdx].recurDefs[k];
   char s[6], e[6];
   snprintf(s, 6, "%02d:%02d", d.sh, d.sm);
   snprintf(e, 6, "%02d:%02d", d.eh, d.em);
   bool hasCode = strlen(d.code) > 0;
-  String codeField = hasCode ? (",\"code\":\"" + String(d.code) + "\"") : "";
-  String bbField   = (strlen(d.bookedBy) > 0) ? (",\"bookedBy\":\"" + String(d.bookedBy) + "\"") : "";
-  String phField   = (strlen(d.phone) > 0)    ? (",\"phone\":\"" + String(d.phone) + "\"") : "";
+  // Per-INSTANCE id — distinct from defId (the link back to the definition).
+  // A new one every materialization, same as the PWA's materializeRecurringSlot
+  // (makeSlotId()) — identity resets daily by design, only defId is stable.
+  // dateStr+k is unique within this one rollover write (each def index k
+  // appears once per day), which is all the PWA's merge-by-id needs — it
+  // only ever compares ids within the same room's CURRENT /slots snapshot.
+  String idField    = ",\"id\":\"sl_" + dateStr + "_" + String(k) + "\"";
+  String codeField  = hasCode ? (",\"code\":\"" + String(d.code) + "\"") : "";
+  String bbField    = (strlen(d.bookedBy) > 0) ? (",\"bookedBy\":\"" + String(d.bookedBy) + "\"") : "";
+  String phField    = (strlen(d.phone) > 0)    ? (",\"phone\":\"" + String(d.phone) + "\"") : "";
+  String defIdField = (strlen(d.defId) > 0)    ? (",\"defId\":\"" + String(d.defId) + "\"") : "";
   String daysField = daysFieldFromMask(d.daysMask);
-  // No-code ("Auto") slots are active by default: seed a non-null activatedAt
-  // so the relay comes on for the window (parseSlots now keys purely on
-  // activatedAt, no longer force-activating on code:null). Coded slots reset to
-  // null so they wait for the QR PIN / admin Activate. Sentinel 1 = "activated,
-  // exact time unknown" — parseSlots only checks non-null.
-  String activatedField = hasCode ? ",\"activatedAt\":null" : ",\"activatedAt\":1";
-  return "{\"s\":\"" + String(s) + "\",\"e\":\"" + String(e) + "\",\"recurring\":true" +
-    codeField + bbField + phField + daysField + ",\"date\":\"" + dateStr + "\"" + activatedField + "}";
+  String activatedField, activatedByField;
+  if (overrideActivatedAtRaw.length() > 0) {
+    activatedField   = ",\"activatedAt\":" + overrideActivatedAtRaw;
+    activatedByField = (overrideActivatedBy.length() > 0) ? (",\"activatedBy\":\"" + overrideActivatedBy + "\"") : "";
+  } else {
+    // No-code ("Auto") slots are active by default: seed a non-null activatedAt
+    // so the relay comes on for the window (parseSlots now keys purely on
+    // activatedAt, no longer force-activating on code:null). Coded slots reset to
+    // null so they wait for the QR PIN / admin Activate. Sentinel 1 = "activated,
+    // exact time unknown" — parseSlots only checks non-null.
+    activatedField = hasCode ? ",\"activatedAt\":null" : ",\"activatedAt\":1";
+  }
+  return "{\"s\":\"" + String(s) + "\",\"e\":\"" + String(e) + "\",\"recurring\":true" + idField + defIdField +
+    codeField + bbField + phField + daysField + ",\"date\":\"" + dateStr + "\"" + activatedField + activatedByField + "}";
 }
 
 // today) — a slot created for today AFTER that first run must not be
@@ -1016,12 +1106,22 @@ bool midnightRollover() {
     // Regenerate today's recurring slots FROM the recurring DEFINITIONS
     // (/rooms/roomN/recurring), not from whatever is in the buckets. A def
     // whose daysMask excludes today is simply not emitted into today. daysMask
-    // 0 = every day. Stable code + booker/phone carried, activation reset.
+    // 0 = every day. Stable code + booker/phone carried; activation resets
+    // UNLESS this same occurrence was already activated in tomorrowJson (the
+    // bucket it's being promoted FROM) — e.g. someone used the activation
+    // page's lookahead window to activate it before midnight. That activation
+    // is carried forward instead of being silently undone by the relabel.
     int todayWd = nowWeekday();
     for (int k = 0; k < rooms[i].recurDefCount; k++) {
-      if (!maskRunsOnDay(rooms[i].recurDefs[k].daysMask, todayWd)) continue;
+      RecurDef &def = rooms[i].recurDefs[k];
+      if (!maskRunsOnDay(def.daysMask, todayWd)) continue;
       if (!first) newTodayJson += ",";
-      newTodayJson += buildDefSlotJson(i, k, getDateStr());
+      char sBuf[6], eBuf[6];
+      snprintf(sBuf, 6, "%02d:%02d", def.sh, def.sm);
+      snprintf(eBuf, 6, "%02d:%02d", def.eh, def.em);
+      String overrideAt = "", overrideBy = "";
+      findActivatedRecurringInstance(tomorrowJson, String(def.defId), String(sBuf), String(eBuf), overrideAt, overrideBy);
+      newTodayJson += buildDefSlotJson(i, k, getDateStr(), overrideAt, overrideBy);
       first = false;
     }
 
@@ -1062,9 +1162,16 @@ bool midnightRollover() {
             String startStr = tomorrowJson.substring(si + 5, si + 10);
             String endStr   = tomorrowJson.substring(ei + 5, ei + 10);
             if (!first) newTodayJson += ",";
-            // Preserve code + the booker's name/phone (see the recurring
+            // Preserve id + code + the booker's name/phone (see the recurring
             // loop above for why) — omit only activatedAt, and re-stamp
-            // date to today since this slot is leaving "tomorrow" now.
+            // date to today since this slot is leaving "tomorrow" now. This
+            // is the SAME slot (just relabeled to today), so its id must
+            // survive the move — dropping it would make the PWA's merge-by-id
+            // treat it as a brand-new slot instead of recognizing it, on the
+            // next push. Only a slot that somehow has no id yet (pre-dates
+            // the id field) gets a fresh one here.
+            String id2 = extractStringField(obj, "id");
+            String idField2 = (id2.length() > 0) ? (",\"id\":\"" + id2 + "\"") : (",\"id\":\"sl_" + getDateStr() + "_" + String(si) + "\"");
             String codeField2 = "", bookedByField2 = "", phoneField2 = "";
             String c2 = extractStringField(obj, "code");
             if (c2.length() > 0) codeField2 = ",\"code\":\"" + c2 + "\"";
@@ -1076,7 +1183,7 @@ bool midnightRollover() {
             // promotion; coded slot → null (re-activation required). Matches
             // the new activatedAt-only rule in parseSlots.
             String activatedField2 = (c2.length() > 0) ? ",\"activatedAt\":null" : ",\"activatedAt\":1";
-            newTodayJson += "{\"s\":\"" + startStr + "\",\"e\":\"" + endStr + "\"" +
+            newTodayJson += "{\"s\":\"" + startStr + "\",\"e\":\"" + endStr + "\"" + idField2 +
               codeField2 + bookedByField2 + phoneField2 + ",\"date\":\"" + getDateStr() + "\"" + activatedField2 + "}";
             first = false;
           }
@@ -1095,11 +1202,13 @@ bool midnightRollover() {
     String tomorrowDate = getTomorrowDateStr();
     String newTomorrowJson = "[";
     bool tfirst = true;
-    // Tomorrow's recurring slots, also generated FROM the definitions.
+    // Tomorrow's recurring slots, also generated FROM the definitions. These
+    // are brand-new future occurrences (not yet materialized anywhere), so
+    // there's nothing to carry forward — always the normal reset.
     for (int k = 0; k < rooms[i].recurDefCount; k++) {
       if (!maskRunsOnDay(rooms[i].recurDefs[k].daysMask, tomorrowWd)) continue;
       if (!tfirst) newTomorrowJson += ",";
-      newTomorrowJson += buildDefSlotJson(i, k, tomorrowDate);
+      newTomorrowJson += buildDefSlotJson(i, k, tomorrowDate, "", "");
       tfirst = false;
     }
     newTomorrowJson += "]";

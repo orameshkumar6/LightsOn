@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#1a1a2e">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <title>Booking Request</title>
+  <style>
+    :root {
+      --bg: #0f0f1a; --surface: #1a1a2e; --card: #22223b; --card2: #2d2d4e;
+      --border: rgba(255,255,255,0.08); --text: #f0f0f5; --muted: #8888aa;
+      --accent: #4a8fff; --amber: #f0a030; --red: #e05050; --green: #40c080;
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; }
+
+    .header { background: var(--surface); padding: 16px; text-align: center; border-bottom: 1px solid var(--border); }
+    .header h1 { font-size: 18px; font-weight: 600; }
+    .header p  { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+    .content { padding: 16px; max-width: 480px; margin: 0 auto; }
+
+    /* Room / slot list — same sizing as the activation page for consistency,
+       except each slot block itself is scaled to 60% height/width (padding,
+       font sizes, dot size and gap all reduced to ~60% of their prior value;
+       an explicit width:60% shrinks the card's footprint horizontally too). */
+    .room-group { margin-bottom: 22px; }
+    .room-group-title { font-size: 17px; font-weight: 700; color: var(--text); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 12px; padding: 0 2px; }
+    /* Two cards per row — makes better use of the screen width and needs
+       far less vertical scrolling than a single full-width column. */
+    .slot-cards-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .slot-card { background: var(--card); border-radius: 10px; padding: 10px; border: 1px solid var(--border); cursor: pointer; transition: border-color 0.2s; display: flex; flex-direction: column; gap: 5px; }
+    .slot-card:hover { border-color: var(--accent); }
+    .slot-card.selected { border-color: var(--accent); background: rgba(74,143,255,0.08); }
+    /* Tomorrow's cards get their own amber colour scheme so the two days are
+       distinguishable at a glance, not just by reading the small day label. */
+    .slot-card.tomorrow { border-color: rgba(240,160,48,0.35); background: rgba(240,160,48,0.07); }
+    .slot-card.tomorrow:hover { border-color: var(--amber); }
+    .slot-card.tomorrow.selected { border-color: var(--amber); background: rgba(240,160,48,0.14); }
+    .slot-card-top { display: flex; align-items: center; gap: 6px; }
+    .slot-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--green); }
+    .slot-card.tomorrow .slot-dot { background: var(--amber); }
+    .slot-time { font-size: 13px; font-weight: 600; }
+    .slot-badge { font-size: 9px; color: var(--muted); }
+    .slot-card.tomorrow .slot-badge { color: var(--amber); font-weight: 600; }
+    .slot-status-badge { align-self: flex-start; font-size: 9px; padding: 4px 8px; border-radius: 12px; font-weight: 600; white-space: nowrap; background: rgba(74,143,255,0.12); color: var(--accent); }
+    .slot-card.tomorrow .slot-status-badge { background: rgba(240,160,48,0.16); color: var(--amber); }
+    .no-slots { text-align: center; padding: 40px 20px; color: var(--muted); font-size: 14px; }
+
+    /* Name/phone form overlay — same bottom-sheet pattern as the PIN pad */
+    .form-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: flex-end; justify-content: center; z-index: 100; opacity: 0; pointer-events: none; transition: opacity 0.25s; }
+    .form-overlay.show { opacity: 1; pointer-events: all; }
+    .form-panel { background: var(--surface); border-radius: 20px 20px 0 0; padding: 20px 20px 28px; width: 100%; max-width: 480px; }
+    .form-title { text-align: center; font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+    .form-sub   { text-align: center; font-size: 13px; color: var(--muted); margin-bottom: 18px; }
+    .form-field { margin-bottom: 14px; }
+    .form-field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    .form-field input { width: 100%; padding: 14px 14px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 16px; }
+    .form-field input:focus { outline: none; border-color: var(--accent); }
+    .form-error { text-align: center; font-size: 13px; color: var(--red); margin-top: 4px; min-height: 18px; }
+    .form-submit { width: 100%; padding: 16px; border-radius: var(--radius); border: none; background: var(--accent); color: white; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 4px; }
+    .form-submit:active { opacity: 0.85; }
+    .form-cancel { width: 100%; padding: 12px; margin-top: 10px; border-radius: var(--radius); border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 14px; cursor: pointer; }
+
+    /* Loading */
+    .loading { text-align: center; padding: 60px 20px; color: var(--muted); }
+    .spinner { width: 32px; height: 32px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Success flash */
+    .success-overlay { position: fixed; inset: 0; background: rgba(64,192,128,0.15); display: flex; align-items: center; justify-content: center; z-index: 200; opacity: 0; pointer-events: none; transition: opacity 0.3s; }
+    .success-overlay.show { opacity: 1; }
+    .success-box { background: var(--card); border-radius: var(--radius); padding: 32px; text-align: center; border: 1px solid var(--green); }
+    .success-icon { font-size: 48px; margin-bottom: 12px; }
+    .success-text { font-size: 18px; font-weight: 600; color: var(--green); }
+    .success-sub  { font-size: 13px; color: var(--muted); margin-top: 6px; }
+    .product-info-footer { text-align: center; font-size: 12px; color: var(--muted); padding: 20px 16px 24px; line-height: 1.6; }
+    .product-info-footer a { color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span id="profileName"></span>Request a Booking</h1>
+  <p id="headerDate"></p>
+</div>
+
+<div class="content">
+  <div class="loading" id="loadingState">
+    <div class="spinner"></div>
+    Loading available slots…
+  </div>
+  <div id="slotList" style="display:none"></div>
+</div>
+
+<div class="product-info-footer" id="productInfoFooter"></div>
+
+<!-- Name / phone form overlay -->
+<div class="form-overlay" id="formOverlay">
+  <div class="form-panel">
+    <div class="form-title">Request this slot</div>
+    <div class="form-sub" id="formSub"></div>
+    <div class="form-field">
+      <label for="reqName">Your name</label>
+      <input type="text" id="reqName" placeholder="e.g. Arjun" autocomplete="name">
+    </div>
+    <div class="form-field">
+      <label for="reqPhone">Mobile number</label>
+      <input type="tel" id="reqPhone" placeholder="10-digit mobile number" autocomplete="tel" inputmode="numeric">
+    </div>
+    <div class="form-error" id="formError"></div>
+    <button class="form-submit" onclick="submitRequest()">Send request</button>
+    <button class="form-cancel" onclick="closeForm()">Cancel</button>
+  </div>
+</div>
+
+<!-- Success overlay -->
+<div class="success-overlay" id="successOverlay">
+  <div class="success-box">
+    <div class="success-icon">✅</div>
+    <div class="success-text">Request sent!</div>
+    <div class="success-sub" id="successSub"></div>
+  </div>
+</div>
+
+<script src="product-info.js"></script>
+<script>
+document.getElementById('productInfoFooter').innerHTML = productInfoHtml();
+
+// ── Config — supplied via ?db=&p= baked into each profile's QR code ────
+const FIREBASE_URL   = new URLSearchParams(location.search).get('db') || '';
+const PROFILE_NUM    = new URLSearchParams(location.search).get('p') || '';
+const PROFILE_PREFIX = PROFILE_NUM ? '/profiles/' + PROFILE_NUM : '';
+
+// ── State ─────────────────────────────────────────────────────
+let allRooms = [];       // [{id, name, options:[{date, dayIdx, s, e}]}]
+let selectedOption = null;
+let loadingSlots = false;
+
+// ── Helpers ───────────────────────────────────────────────────
+function toMins(t) { const [h,m]=t.split(':').map(Number); return h*60+m; }
+function minsToTimeStr(m) { return String(Math.floor(m/60)).padStart(2,'0') + ':' + String(m%60).padStart(2,'0'); }
+
+function nowMins() {
+  const n = new Date(); return n.getHours()*60 + n.getMinutes();
+}
+function todayStr() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+function tomorrowStr() {
+  const d = new Date(); d.setDate(d.getDate()+1);
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+
+// ── Firebase REST — same minimal helpers as activate.html ──────
+async function fbGet(path) {
+  try {
+    const url = FIREBASE_URL + PROFILE_PREFIX + path + '.json?nc=' + Date.now();
+    const res = await fetch(url, { cache: 'no-store', headers: { 'Accept': 'application/json' } });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch(e) { return null; }
+}
+async function fbPut(path, value) {
+  try {
+    await fetch(FIREBASE_URL + PROFILE_PREFIX + path + '.json', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(value)
+    });
+    return true;
+  } catch(e) { return false; }
+}
+
+function makeRequestId() {
+  return 'req_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+function normalizeArr(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v;
+  return Object.keys(v).sort((a,b)=>parseInt(a)-parseInt(b)).map(k => v[k]);
+}
+
+// ── Load rooms + compute AVAILABLE (free) 1-hour blocks for today/tomorrow ──
+// Same occupancy scan the admin's own slot-add grid uses (renderGridOccupancy
+// in index.html), just inverted: a block is offered here when NOTHING
+// occupies it, instead of being coloured because something does.
+async function loadAvailability() {
+  if (!FIREBASE_URL || !PROFILE_NUM) {
+    document.getElementById('loadingState').style.display = 'none';
+    document.getElementById('slotList').style.display = 'block';
+    document.getElementById('slotList').innerHTML =
+      `<div class="no-slots">This booking link is missing its configuration.<br>
+        <span style="font-size:12px;color:var(--muted);margin-top:8px;display:block">
+          Please re-scan the QR code from the ${PRODUCT_INFO.name} dashboard.
+        </span>
+      </div>`;
+    return;
+  }
+  if (loadingSlots) return;
+  loadingSlots = true;
+
+  try {
+    const rooms = await fbGet('/rooms');
+    if (!rooms) {
+      document.getElementById('loadingState').style.display = 'none';
+      document.getElementById('slotList').style.display = 'block';
+      document.getElementById('slotList').innerHTML = `<div class="no-slots">Could not connect to Firebase.<br>Check your internet connection.</div>`;
+      return;
+    }
+
+    const nm = nowMins();
+    const todayWd = new Date().getDay();
+    const tomorrowWd = (todayWd + 1) % 7;
+    const roomKeys = Object.keys(rooms).sort();
+    const newAllRooms = [];
+
+    for (const key of roomKeys) {
+      const room = rooms[key];
+      const roomId = parseInt(key.replace('room', ''));
+      const roomName = room.name || key;
+
+      // Build a 24-slot occupied[] array per day the same way the admin's
+      // slot-add grid does (renderGridOccupancy) — occupied[i] true if hour
+      // block i overlaps an existing slot (respecting recurring day-gating).
+      const buildOccupied = (slots, weekday) => {
+        const occ = new Array(24).fill(false);
+        normalizeArr(slots).forEach(sl => {
+          if (!sl || !sl.s || !sl.e) return;
+          if (sl.recurring && Array.isArray(sl.days) && sl.days.length && !sl.days.includes(weekday)) return;
+          const si = Math.floor(toMins(sl.s) / 60);
+          const ei = Math.ceil(toMins(sl.e) / 60);
+          for (let i = Math.max(0, si); i < Math.min(24, ei); i++) occ[i] = true;
+        });
+        return occ;
+      };
+
+      const occToday    = buildOccupied(room.slots,  todayWd);
+      const occTomorrow = buildOccupied(room.slotsT, tomorrowWd);
+
+      const options = [];
+      const nowHour = Math.floor(nm / 60);
+      for (let h = 0; h < 24; h++) {
+        // Today: skip any hour that's already started/passed.
+        if (!occToday[h] && h > nowHour) {
+          options.push({ dayIdx: 0, date: todayStr(), s: minsToTimeStr(h*60), e: minsToTimeStr((h+1)*60), label: 'Today' });
+        }
+      }
+      for (let h = 0; h < 24; h++) {
+        if (!occTomorrow[h]) {
+          options.push({ dayIdx: 1, date: tomorrowStr(), s: minsToTimeStr(h*60), e: minsToTimeStr((h+1)*60), label: 'Tomorrow' });
+        }
+      }
+
+      if (options.length > 0) newAllRooms.push({ id: roomId, name: roomName, options });
+    }
+
+    allRooms = newAllRooms;
+    document.getElementById('loadingState').style.display = 'none';
+    renderOptions();
+  } catch(e) {
+    document.getElementById('loadingState').style.display = 'none';
+    document.getElementById('slotList').style.display = 'block';
+    document.getElementById('slotList').innerHTML = `<div class="no-slots">Error loading availability. Please refresh the page.</div>`;
+  } finally {
+    loadingSlots = false;
+  }
+}
+
+function renderOptions() {
+  const container = document.getElementById('slotList');
+  container.style.display = 'block';
+
+  if (allRooms.length === 0) {
+    container.innerHTML = `<div class="no-slots">
+      No free slots for today or tomorrow right now.<br>
+      <span style="font-size:12px;color:var(--muted);margin-top:8px;display:block">Please check back later.</span>
+    </div>`;
+    return;
+  }
+
+  container.innerHTML = allRooms.map(room => {
+    const cards = room.options.map((opt, idx) => `
+      <div class="slot-card${opt.dayIdx === 1 ? ' tomorrow' : ''}" onclick="selectOption(${room.id}, ${idx})">
+        <div class="slot-card-top">
+          <div class="slot-dot"></div>
+          <div class="slot-time">${opt.s} – ${opt.e}</div>
+        </div>
+        <div class="slot-badge">${opt.label}</div>
+        <span class="slot-status-badge">Tap to request</span>
+      </div>
+    `).join('');
+    return `<div class="room-group">
+      <div class="room-group-title">${room.name}</div>
+      <div class="slot-cards-grid">${cards}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── Select an option → show name/phone form ─────────────────────
+function selectOption(roomId, idx) {
+  const room = allRooms.find(r => r.id === roomId);
+  if (!room) return;
+  selectedOption = { room, opt: room.options[idx] };
+  document.getElementById('reqName').value = '';
+  document.getElementById('reqPhone').value = '';
+  document.getElementById('formError').textContent = '';
+  document.getElementById('formSub').textContent =
+    `${room.name} · ${selectedOption.opt.s} – ${selectedOption.opt.e} (${selectedOption.opt.label})`;
+  document.getElementById('formOverlay').classList.add('show');
+}
+
+function closeForm() {
+  document.getElementById('formOverlay').classList.remove('show');
+  selectedOption = null;
+}
+
+function makeSlotId() {
+  return 'sl_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+function generate4DigitCode() {
+  return String(Math.floor(1000 + Math.random() * 9000));
+}
+
+// Once a specific room+date+time is booked, every OTHER still-open request
+// for that exact same slot can never be honoured — decline them so they
+// don't linger looking actionable in the admin's Requests tab. Mirrors
+// index.html's declineSiblingRequests; duplicated here (rather than shared)
+// since this page has no access to index.html's fbPatch helper — merges the
+// change onto the full fetched object itself before writing it back with
+// fbPut (a plain PUT, unlike fbPatch, replaces the whole node).
+async function declineSiblingRequestsPublic(confirmedReq, excludeId) {
+  const data = await fbGet('/requests');
+  if (!data || typeof data !== 'object') return;
+  const jobs = Object.keys(data)
+    .filter(rid => rid !== excludeId)
+    .filter(rid => {
+      const r = data[rid];
+      return r && r.status !== 'confirmed' && r.status !== 'declined' &&
+        r.roomId === confirmedReq.roomId && r.date === confirmedReq.date &&
+        r.s === confirmedReq.s && r.e === confirmedReq.e;
+    })
+    .map(rid => fbPut('/requests/' + rid, { ...data[rid], status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' }));
+  await Promise.all(jobs);
+}
+
+// Called only when /config/autoApproveBookings is true. Re-checks
+// availability right before writing (someone may have booked this exact
+// time in the moments since the page loaded), then creates the slot at a
+// fresh index — a targeted single-index PUT, never a wholesale overwrite of
+// the whole bucket, so it can never clobber a slot something else just
+// added to the same room. Returns true if it actually booked the slot;
+// false if the slot turned out to already be taken (request is declined
+// in that case, not left dangling as "open").
+async function tryAutoApprove(id, room, opt, reqObj) {
+  const bucketPath = '/rooms/room' + room.id + (opt.dayIdx === 0 ? '/slots' : '/slotsT');
+  const arr = normalizeArr(await fbGet(bucketPath));
+  const collision = arr.some(sl => sl && sl.s === opt.s && sl.e === opt.e);
+  if (collision) {
+    await fbPut('/requests/' + id, { ...reqObj, status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' });
+    return false;
+  }
+
+  const newSlot = {
+    id: makeSlotId(),
+    s: opt.s, e: opt.e, recurring: false,
+    code: generate4DigitCode(),
+    paid: false,
+    activatedAt: null, activatedBy: null, attempts: 0, lockedUntil: null, expired: false,
+    date: opt.date,
+    bookedBy: reqObj.name, phone: reqObj.phone,
+    slotTs: Date.now()
+  };
+  const ok = await fbPut(bucketPath + '/' + arr.length, newSlot);
+  if (!ok) return false;
+
+  await fbPut('/requests/' + id, {
+    ...reqObj, status: 'confirmed', confirmedAt: Date.now(),
+    confirmedRoomId: room.id, confirmedSlotId: newSlot.id
+  });
+  await declineSiblingRequestsPublic(reqObj, id);
+  return true;
+}
+
+async function submitRequest() {
+  if (!selectedOption) return;
+  const name  = document.getElementById('reqName').value.trim();
+  const phone = document.getElementById('reqPhone').value.trim();
+  if (!name) { document.getElementById('formError').textContent = 'Please enter your name'; return; }
+  if (!/^\d{7,15}$/.test(phone.replace(/[^\d]/g, ''))) {
+    document.getElementById('formError').textContent = 'Please enter a valid mobile number';
+    return;
+  }
+
+  const { room, opt } = selectedOption;
+  const id = makeRequestId();
+  const reqObj = {
+    roomId: room.id,
+    roomName: room.name,
+    date: opt.date,
+    dayIdx: opt.dayIdx,
+    s: opt.s,
+    e: opt.e,
+    name,
+    phone: phone.replace(/[^\d]/g, ''),
+    status: 'open',
+    createdAt: Date.now()
+  };
+  const ok = await fbPut('/requests/' + id, reqObj);
+
+  if (!ok) {
+    document.getElementById('formError').textContent = 'Network error — please try again';
+    return;
+  }
+
+  document.getElementById('formOverlay').classList.remove('show');
+
+  // Auto-approve: try to confirm immediately. If the slot turned out to
+  // already be taken, tell the visitor instead of showing a false success
+  // and refresh the list so they can pick something else.
+  const autoApprove = await fbGet('/config/autoApproveBookings');
+  if (autoApprove === true) {
+    const booked = await tryAutoApprove(id, room, opt, reqObj);
+    if (!booked) {
+      document.getElementById('loadingState').style.display = 'none';
+      document.getElementById('slotList').innerHTML =
+        `<div class="no-slots">Sorry — that slot was just taken by someone else.<br>
+          <span style="font-size:12px;color:var(--muted);margin-top:8px;display:block">Please pick another below.</span>
+        </div>`;
+      await loadAvailability();
+      return;
+    }
+    document.getElementById('successSub').textContent =
+      `${room.name} · ${opt.s} – ${opt.e} (${opt.label}) — code required at the room`;
+    document.getElementById('successOverlay').querySelector('.success-text').textContent = 'Booking confirmed!';
+  } else {
+    document.getElementById('successSub').textContent =
+      `${room.name} · ${opt.s} – ${opt.e} (${opt.label})`;
+    document.getElementById('successOverlay').querySelector('.success-text').textContent = 'Request sent!';
+  }
+
+  document.getElementById('successOverlay').classList.add('show');
+  setTimeout(() => {
+    document.getElementById('successOverlay').classList.remove('show');
+    closePage('submitted');
+  }, 4000);
+}
+
+// ── Boot ──────────────────────────────────────────────────────
+document.getElementById('headerDate').textContent =
+  new Date().toLocaleDateString([], { weekday:'long', month:'long', day:'numeric' });
+
+// ── Auto-close (lifetime + idle) — same pattern as activate.html ────────
+// This page is meant to be short-lived too: 3 minutes idle, or a generous
+// 10-minute hard cap regardless of activity. Browsers only allow a
+// script-initiated window.close() on a tab the script itself opened; most
+// QR scanners hand the link to the OS, which opens a normal tab, so
+// window.close() silently no-ops there — replace the page with a "you can
+// close this tab" message in that case instead of leaving the UI open.
+const MAX_LIFETIME_MS = 10 * 60 * 1000; // hard cap: 10 minutes
+const IDLE_TIMEOUT_MS = 3 * 60 * 1000;  // idle cap: 3 minutes (the actual close condition in practice)
+let pageClosed = false;
+
+function closePage(reason) {
+  if (pageClosed) return;
+  pageClosed = true;
+  if (idleTimer) clearTimeout(idleTimer);
+  if (lifetimeTimer) clearTimeout(lifetimeTimer);
+
+  window.close();
+
+  setTimeout(() => {
+    document.body.innerHTML =
+      '<div style="min-height:100vh;display:flex;flex-direction:column;' +
+      'align-items:center;justify-content:center;text-align:center;padding:24px;' +
+      'font-family:system-ui,-apple-system,sans-serif;color:#888;gap:12px;"' + '>' +
+      '<div style="font-size:40px">👋</div>' +
+      '<div style="font-size:16px">' +
+      (reason === 'submitted' ? 'Request sent.' : 'Session timed out.') +
+      '</div>' +
+      '<div style="font-size:13px">You can close this tab now.</div>' +
+      '</div>';
+  }, 300);
+}
+
+let lifetimeTimer = setTimeout(() => closePage('timeout'), MAX_LIFETIME_MS);
+let idleTimer = setTimeout(() => closePage('timeout'), IDLE_TIMEOUT_MS);
+function resetIdleTimer() {
+  if (pageClosed) return;
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => closePage('timeout'), IDLE_TIMEOUT_MS);
+}
+['pointerdown', 'keydown', 'touchstart', 'click'].forEach(evt => {
+  document.addEventListener(evt, resetIdleTimer, { passive: true });
+});
+
+if (FIREBASE_URL && PROFILE_NUM) {
+  loadAvailability();
+  // Full refresh every 15 seconds — keeps availability current if someone
+  // else books a slot while this page is open.
+  setInterval(() => { if (!document.getElementById('formOverlay').classList.contains('show')) loadAvailability(); }, 15000);
+} else {
+  loadAvailability(); // shows the "missing configuration" message
+}
+</script>
+</body>
+</html>

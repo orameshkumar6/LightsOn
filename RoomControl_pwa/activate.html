@@ -26,23 +26,24 @@
 
     .content { padding: 16px; max-width: 480px; margin: 0 auto; }
 
-    /* Slot list */
-    .room-group { margin-bottom: 12px; }
-    .room-group-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; padding: 0 2px; }
-    .slot-card { background: var(--card); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 6px; border: 1px solid var(--border); cursor: pointer; display: flex; align-items: center; gap: 10px; transition: border-color 0.2s; }
+    /* Slot list — sized up for easy scanning/tapping when choosing between
+       several slots (was cramped enough to cause mis-taps on the wrong one). */
+    .room-group { margin-bottom: 22px; }
+    .room-group-title { font-size: 17px; font-weight: 700; color: var(--text); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 12px; padding: 0 2px; }
+    .slot-card { background: var(--card); border-radius: 16px; padding: 18px 20px; margin-bottom: 12px; border: 1px solid var(--border); cursor: pointer; display: flex; align-items: center; gap: 16px; transition: border-color 0.2s; }
     .slot-card:hover { border-color: var(--accent); }
     .slot-card.active   { border-color: var(--green); background: rgba(64,192,128,0.06); cursor: default; }
     .slot-card.locked   { border-color: var(--red);   background: rgba(224,80,80,0.06);  cursor: default; }
     .slot-card.selected { border-color: var(--accent); background: rgba(74,143,255,0.08); }
-    .slot-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-    .slot-dot.active { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .slot-dot { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; }
+    .slot-dot.active { background: var(--green); box-shadow: 0 0 8px var(--green); }
     .slot-dot.locked { background: var(--red); }
     .slot-dot.pending { background: var(--muted); }
     .slot-dot.selected { background: var(--accent); }
     .slot-info { flex: 1; }
-    .slot-time { font-size: 14px; font-weight: 500; }
-    .slot-badge { font-size: 11px; color: var(--muted); margin-top: 2px; }
-    .slot-status-badge { font-size: 11px; padding: 3px 10px; border-radius: 20px; font-weight: 500; }
+    .slot-time { font-size: 20px; font-weight: 600; }
+    .slot-badge { font-size: 14px; color: var(--muted); margin-top: 5px; }
+    .slot-status-badge { font-size: 14px; padding: 6px 14px; border-radius: 20px; font-weight: 600; white-space: nowrap; }
     .badge-active { background: rgba(64,192,128,0.15); color: var(--green); }
     .badge-locked { background: rgba(224,80,80,0.15); color: var(--red); }
     .badge-tap    { background: rgba(74,143,255,0.12); color: var(--accent); }
@@ -300,35 +301,60 @@ async function loadSlots() {
       // Only valid slots with s and e fields
       const slots = slotsArr.filter(s => s && s.s && s.e);
 
-      // Show all slots not yet ended, except tomorrow's
-      const todaySlots = [];
-      slots.forEach((sl, originalIndex) => {
-        if (sl.date === tomorrowStr()) return; // skip tomorrow
-        if (toMins(sl.e) <= nm) return;        // skip ended
-        if (toMins(sl.s) > windowEndMins) return; // skip slots starting beyond the configured window
-        // Day-of-week recurrence: a recurring slot with a days list only shows
-        // on its configured weekdays. No days list (or non-recurring) = every day.
-        if (sl.recurring && Array.isArray(sl.days) && sl.days.length &&
-            !sl.days.includes(new Date().getDay())) return;
-
-        const mergedSlot = { ...sl, origIdx: originalIndex, roomKey: key };
-
-        // Preserve activation state from previous allRooms if Firebase returns null
-        // Match by room + origIdx (Firebase index) for exact slot identification
-        // Prevents wrong slot's activation being applied to a different slot
+      // Carries a slot's Firebase bucket + index along so activation writes
+      // and the "preserve state from the previous load" match below can
+      // target the right node — origIdx alone collides between /slots and
+      // /slotsT (both are 0-based arrays).
+      const buildMerged = (sl, originalIndex, bucket) => {
+        const mergedSlot = { ...sl, origIdx: originalIndex, roomKey: key, bucket };
+        // Preserve activation state from previous allRooms if Firebase returns null.
+        // Match by room + bucket + origIdx for exact slot identification —
+        // prevents wrong slot's activation being applied to a different slot.
         if (!mergedSlot.activatedAt) {
-          const roomId  = parseInt(key.replace('room', ''));
           const prevRoom = prevAllRooms.find(r => r.id === roomId);
           const prevSlot = prevRoom && prevRoom.slots.find(
-            ps => ps.origIdx === originalIndex  // exact Firebase index match
+            ps => ps.origIdx === originalIndex && (ps.bucket || 'slots') === bucket
           );
           if (prevSlot && prevSlot.activatedAt) {
             mergedSlot.activatedAt = prevSlot.activatedAt;
             mergedSlot.activatedBy = prevSlot.activatedBy;
           }
         }
-        todaySlots.push(mergedSlot);
+        return mergedSlot;
+      };
+
+      // Show all of today's slots not yet ended, and starting within the window.
+      const todaySlots = [];
+      slots.forEach((sl, originalIndex) => {
+        if (sl.date === tomorrowStr()) return; // skip tomorrow — handled from /slotsT below
+        if (toMins(sl.e) <= nm) return;        // skip ended
+        if (toMins(sl.s) > windowEndMins) return; // skip slots starting beyond the configured window
+        // Day-of-week recurrence: a recurring slot with a days list only shows
+        // on its configured weekdays. No days list (or non-recurring) = every day.
+        if (sl.recurring && Array.isArray(sl.days) && sl.days.length &&
+            !sl.days.includes(new Date().getDay())) return;
+        todaySlots.push(buildMerged(sl, originalIndex, 'slots'));
       });
+
+      // The lookahead window can reach past midnight (e.g. it's 23:00 with a
+      // 4h window → windowEndMins = 1620, i.e. up to 3:00 AM tomorrow). Only
+      // then is it worth reading /slotsT at all — a slot starting at X
+      // tomorrow is "within the window" when toMins(X) <= windowEndMins-1440
+      // (the portion of the window that spills past midnight).
+      if (windowHours > 0 && windowEndMins > 1440) {
+        const wrappedEndMins = windowEndMins - 1440;
+        const rawSlotsT = await fbGet('/rooms/' + key + '/slotsT');
+        let slotsTArr = [];
+        if (Array.isArray(rawSlotsT)) slotsTArr = rawSlotsT;
+        else if (rawSlotsT) slotsTArr = Object.keys(rawSlotsT).sort((a,b)=>parseInt(a)-parseInt(b)).map(k => rawSlotsT[k]);
+        const tomorrowWd = (new Date().getDay() + 1) % 7;
+        slotsTArr.filter(s => s && s.s && s.e).forEach((sl, originalIndex) => {
+          if (toMins(sl.s) > wrappedEndMins) return; // starts beyond the window's tomorrow portion
+          if (sl.recurring && Array.isArray(sl.days) && sl.days.length &&
+              !sl.days.includes(tomorrowWd)) return;
+          todaySlots.push(buildMerged(sl, originalIndex, 'slotsT'));
+        });
+      }
 
       if (todaySlots.length > 0) {
         allRooms.push({ id: roomId, name: roomName, slots: todaySlots });
@@ -354,12 +380,13 @@ async function verifyAndRender() {
 
   for (const room of allRooms) {
     for (const sl of room.slots) {
-      // Only verify slots currently in time window that appear unactivated
-      const isCurrent = toMins(sl.s) <= nm && toMins(sl.e) > nm;
+      // Only verify slots currently in time window that appear unactivated.
+      // A slotsT (tomorrow) entry hasn't started yet by definition — never "current".
+      const isCurrent = sl.bucket !== 'slotsT' && toMins(sl.s) <= nm && toMins(sl.e) > nm;
       if (!isCurrent || sl.activatedAt || !sl.code) continue;
 
       // Fetch latest activatedAt directly from Firebase
-      const val = await fbGet(`/rooms/${sl.roomKey}/slots/${sl.origIdx}/activatedAt`);
+      const val = await fbGet(`/rooms/${sl.roomKey}/${sl.bucket || 'slots'}/${sl.origIdx}/activatedAt`);
       if (val && val !== null) {
         sl.activatedAt = val; // update local — slot IS activated
         needsRerender = true;
@@ -396,7 +423,7 @@ function renderSlots() {
       const isExpired  = !!sl.expired;
       const isLocked   = !!(sl.lockedUntil && Date.now() < sl.lockedUntil);
       const lockMins   = isLocked ? Math.ceil((sl.lockedUntil - Date.now()) / 60000) : 0;
-      const isCurrent  = toMins(sl.s) <= nm && toMins(sl.e) > nm;
+      const isCurrent  = sl.bucket !== 'slotsT' && toMins(sl.s) <= nm && toMins(sl.e) > nm;
       const isWaiting  = !isActive && !isExpired && !!sl.code && isCurrent;
 
       // A no-code slot is "Auto" — active by default with no PIN. But the admin
@@ -447,7 +474,7 @@ function renderSlots() {
         <div class="${dotClass}"></div>
         <div class="slot-info">
           <div class="slot-time">${sl.s} – ${sl.e}${sl.bookedBy ? ` · ${sl.bookedBy}` : ''}</div>
-          <div class="slot-badge">${sl.recurring ? 'Recurring' : 'One-time'}${isCurrent ? ' · Active now' : ''}</div>
+          <div class="slot-badge">${sl.recurring ? 'Recurring' : 'One-time'}${sl.bucket === 'slotsT' ? ' · Tomorrow' : ''}${isCurrent ? ' · Active now' : ''}</div>
         </div>
         ${badge}
       </div>`;
@@ -529,8 +556,9 @@ async function pinSubmit() {
       // ── Correct code ─────────────────────────────────────────
       updatePinDots('ok');
 
-      // Write activatedAt to Firebase
-      const slotBasePath = `/rooms/${selectedSlot.roomKey}/slots/${selectedSlot.origIdx}`;
+      // Write activatedAt to Firebase — bucket is 'slots' or 'slotsT'
+      // depending on which one this slot was loaded from (see loadSlots).
+      const slotBasePath = `/rooms/${selectedSlot.roomKey}/${selectedSlot.bucket || 'slots'}/${selectedSlot.origIdx}`;
       await fbPut(slotBasePath + '/activatedAt', Date.now());
       await fbPut(slotBasePath + '/activatedBy', isAdmin ? 'admin' : 'slot');
       await fbPut(slotBasePath + '/attempts',    0);
@@ -556,7 +584,7 @@ async function pinSubmit() {
       // ── Wrong code ───────────────────────────────────────────
       updatePinDots('error');
 
-      const slotPath2 = `/rooms/${selectedSlot.roomKey}/slots/${selectedSlot.origIdx}`;
+      const slotPath2 = `/rooms/${selectedSlot.roomKey}/${selectedSlot.bucket || 'slots'}/${selectedSlot.origIdx}`;
       // Read current attempts count directly
       const currentAttempts = await fbGet(slotPath2 + '/attempts') || 0;
       const attempts = currentAttempts + 1;
