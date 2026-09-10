@@ -3228,11 +3228,13 @@ function syncFromFirebase(data) {
     const r = data[key];
     const room = state.rooms[idx];
 
-    const lastWrite = overrideWriteTime[idx] || 0;
-    const justWrote = (Date.now() - lastWrite) < 30000;
-    if (r.override === null && !justWrote) {
-      room.override = null;
-    }
+    // Reconcile true/false/null the same way — last-write-wins by
+    // overrideAt, with the 30s just-tapped guard — instead of only ever
+    // accepting a clear-to-Auto (null) live and silently ignoring a Manual
+    // ON/OFF made on another device until the next manual Sync. This is
+    // the exact same rule manualSyncFromFirebase()'s reconcileOverride()
+    // already applies; it just wasn't wired into the live path before.
+    reconcileOverride(room, r);
 
     if (r.lightOn !== undefined) room.lightOn = r.lightOn;
 
