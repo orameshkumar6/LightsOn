@@ -178,6 +178,21 @@ async function fbPut(path, value) {
     return true;
   } catch(e) { return false; }
 }
+// PATCH — partial update: only the child keys given are touched/replaced,
+// every sibling key is left alone. Unlike fbPut (a full replace of the
+// target node), this is safe for batching several children's writes into
+// one request without risking clobbering a concurrent write to a sibling
+// key this call never mentioned.
+async function fbPatch(path, value) {
+  try {
+    await fetch(FIREBASE_URL + PROFILE_PREFIX + path + '.json', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(value)
+    });
+    return true;
+  } catch(e) { return false; }
+}
 
 function makeRequestId() {
   return 'req_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -333,14 +348,16 @@ function generate4DigitCode() {
 // Once a specific room+date+time is booked, every OTHER still-open request
 // for that exact same slot can never be honoured — decline them so they
 // don't linger looking actionable in the admin's Requests tab. Mirrors
-// index.html's declineSiblingRequests; duplicated here (rather than shared)
-// since this page has no access to index.html's fbPatch helper — merges the
-// change onto the full fetched object itself before writing it back with
-// fbPut (a plain PUT, unlike fbPatch, replaces the whole node).
+// index.html's declineSiblingRequests. One multi-path PATCH to /requests
+// with each declined sibling's full object as its value — PATCH only
+// touches the keys given, so any other request another visitor submits in
+// this same window is left untouched, unlike a plain fbPut which would
+// replace the whole /requests node with this (possibly already stale) read.
 async function declineSiblingRequestsPublic(confirmedReq, excludeId) {
   const data = await fbGet('/requests');
   if (!data || typeof data !== 'object') return;
-  const jobs = Object.keys(data)
+  const declineMap = {};
+  Object.keys(data)
     .filter(rid => rid !== excludeId)
     .filter(rid => {
       const r = data[rid];
@@ -348,8 +365,8 @@ async function declineSiblingRequestsPublic(confirmedReq, excludeId) {
         r.roomId === confirmedReq.roomId && r.date === confirmedReq.date &&
         r.s === confirmedReq.s && r.e === confirmedReq.e;
     })
-    .map(rid => fbPut('/requests/' + rid, { ...data[rid], status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' }));
-  await Promise.all(jobs);
+    .forEach(rid => { declineMap[rid] = { ...data[rid], status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' }; });
+  if (Object.keys(declineMap).length > 0) await fbPatch('/requests', declineMap);
 }
 
 // Called only when /config/autoApproveBookings is true. Re-checks
@@ -530,9 +547,14 @@ function resetIdleTimer() {
 
 if (FIREBASE_URL && PROFILE_NUM) {
   loadAvailability();
-  // Full refresh every 15 seconds — keeps availability current if someone
-  // else books a slot while this page is open.
-  setInterval(() => { if (!document.getElementById('formOverlay').classList.contains('show')) loadAvailability(); }, 15000);
+  // Full refresh every 45 seconds — keeps availability current if someone
+  // else books a slot while this page is open. loadAvailability() fetches
+  // the ENTIRE /rooms tree (every room's slots/slotsT/recurring/override),
+  // and this timer keeps running for as long as a visitor leaves the tab
+  // open in the background — 15s made that add up fast across however many
+  // people have the booking link; 45s is still fresh enough for someone
+  // actively browsing a list of hourly slots.
+  setInterval(() => { if (!document.getElementById('formOverlay').classList.contains('show')) loadAvailability(); }, 45000);
 } else {
   loadAvailability(); // shows the "missing configuration" message
 }

@@ -2635,7 +2635,11 @@ function isSlotTaken(req) {
 async function declineSiblingRequests(confirmedReq, excludeId, p) {
   const data = await fbGet('/requests', p);
   if (!data || typeof data !== 'object') return;
-  const jobs = Object.keys(data)
+  // One multi-path PATCH for every sibling instead of one call each —
+  // PATCH only touches the request ids named here, so a request submitted
+  // by someone else in this same window is never affected.
+  const declineMap = {};
+  Object.keys(data)
     .filter(rid => rid !== excludeId)
     .filter(rid => {
       const r = data[rid];
@@ -2643,8 +2647,8 @@ async function declineSiblingRequests(confirmedReq, excludeId, p) {
         r.roomId === confirmedReq.roomId && r.date === confirmedReq.date &&
         r.s === confirmedReq.s && r.e === confirmedReq.e;
     })
-    .map(rid => fbPatch(`/requests/${rid}`, { status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' }, p));
-  await Promise.all(jobs);
+    .forEach(rid => { declineMap[rid] = { ...data[rid], status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' }; });
+  if (Object.keys(declineMap).length > 0) await fbPatch('/requests', declineMap, p);
 }
 
 // Shared by the one-click Confirm and the Edit & Confirm modal: creates a
