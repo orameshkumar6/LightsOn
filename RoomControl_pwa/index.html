@@ -3834,16 +3834,42 @@ async function pushRoom(idx, profile) {
   // the cutoff now reflects every slot that legitimately belongs — including
   // ones this device didn't create — so it can never eat another device's
   // addition again).
+  //
+  // A slot at index i whose patch is byte-identical to what's ALREADY at
+  // remoteSlotsArr[i] (everything except slotTs, which is what we're
+  // deciding here) doesn't need writing at all — this covers a foreign slot
+  // kept as-is (it IS remoteSlotsArr[i] already) as well as every untouched
+  // sibling of whatever this device actually edited. remote[k] ?? null
+  // treats Firebase's "key simply absent" the same as an explicit null,
+  // since that's the equivalence every PATCH here already relies on.
+  const patchMatchesRemote = (patch, remote) => {
+    if (!remote) return false;
+    return Object.keys(patch).every(k => k === 'slotTs' ||
+      JSON.stringify(patch[k]) === JSON.stringify(remote[k] ?? null));
+  };
+  const writeMap = {};
   for (let i = 0; i < finalSlots.length; i++) {
-    ok = await fbPatch(`${roomBase}/slots/${i}`, slotPatches[i], p) && ok;
+    if (patchMatchesRemote(slotPatches[i], remoteSlotsArr[i])) {
+      // Nothing but position matches what's already there — don't churn its
+      // slotTs or send it over the wire.
+      slotPatches[i].slotTs = remoteSlotsArr[i].slotTs;
+      finalSlots[i].slotTs = remoteSlotsArr[i].slotTs;
+      continue;
+    }
+    writeMap[i] = slotPatches[i];
   }
   if (existingSlotsRaw && typeof existingSlotsRaw === 'object') {
     for (const key of Object.keys(existingSlotsRaw)) {
       const ghostIdx = parseInt(key, 10);
-      if (!isNaN(ghostIdx) && ghostIdx >= finalSlots.length) {
-        ok = await fbSet(`${roomBase}/slots/${ghostIdx}`, null, p) && ok;
-      }
+      if (!isNaN(ghostIdx) && ghostIdx >= finalSlots.length) writeMap[ghostIdx] = null;
     }
+  }
+  // One multi-path PATCH instead of one request per changed/pruned index —
+  // Firebase already treats a PATCH body's keys as the children to
+  // update/delete under the target path, so this is the exact same
+  // semantics as the old per-index fbPatch/fbSet calls, just batched.
+  if (Object.keys(writeMap).length > 0) {
+    ok = await fbPatch(`${roomBase}/slots`, writeMap, p) && ok;
   }
   r.slots[0] = finalSlots;
   r._syncedSlotIds = finalSlots.map(sl => sl.id).filter(Boolean);
