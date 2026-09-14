@@ -129,7 +129,12 @@ String profileNum;
 // daysMask: 7-bit weekday set for recurring slots — bit 0=Sun .. bit 6=Sat.
 // 0 = no restriction (runs every day), which keeps pre-V1 recurring slots
 // (and all non-recurring slots) behaving exactly as before.
-struct Slot { int sh, sm, eh, em; bool recurring; bool activated; bool expired; int daysMask; };
+// slotTs mirrors the PWA's per-slot modified-at timestamp (written by
+// pushRoom() on every create/edit). Kept as a string purely for equality
+// comparison in refreshSlotsOnly() — it's a JS millisecond timestamp
+// (~13 digits), too large for a 32-bit int, and nothing here ever needs
+// to do arithmetic on it, only detect "did this slot's content change."
+struct Slot { int sh, sm, eh, em; bool recurring; bool activated; bool expired; int daysMask; char slotTs[16]; };
 
 // A recurring DEFINITION read from /rooms/roomN/recurring — the authoritative
 // source the day buckets are generated FROM during rollover. daysMask uses the
@@ -489,6 +494,10 @@ void parseSlots(int idx, String json) {
   Slot tempSlots[10];
   int  tempCount = 0;
   int  pos = 0;
+  bool sawSlotObject = false; // true if we parsed ANY real slot object, deleted
+                              // or not — distinguishes "every slot got soft-
+                              // deleted, count really is 0" from "couldn't
+                              // parse anything", which must NOT stomp slotCount
 
   while (pos < (int)json.length() && tempCount < 10) {
     int si = json.indexOf("\"s\":\"", pos);
@@ -498,14 +507,22 @@ void parseSlots(int idx, String json) {
     String endStr   = json.substring(ei + 5, ei + 10);
     int sh, sm, eh, em;
     if (parseTime(startStr, sh, sm) && parseTime(endStr, eh, em)) {
+      sawSlotObject = true; // saw a real slot object, even if it turns out deleted below
       int objStart = json.lastIndexOf('{', si);
       int objEnd   = json.indexOf('}', ei);
       bool isRecurring = false;
       bool isActivated = false;
       bool isExpired   = false;
+      bool isDeleted   = false;
       int  slotDaysMask = 0; // 0 = every day (see Slot.daysMask)
+      String slotTsStr = ""; // "" if absent — compares unequal to any real timestamp, which is fine
       if (objStart >= 0 && objEnd >= 0) {
         String slotObj = json.substring(objStart, objEnd + 1);
+        slotTsStr = extractRawField(slotObj, "slotTs");
+        // Soft-deleted (see the PWA's deleteSlot()) — skip entirely, never
+        // scheduled/activated. It stays in Firebase, still carrying its id,
+        // until the next midnightRollover() permanently drops it.
+        isDeleted = slotObj.indexOf("\"deleted\":true") >= 0;
         // Recurring flag
         isRecurring = slotObj.indexOf("\"recurring\":true") >= 0;
         // Activated: activatedAt exists and is NOT null. This is now the SINGLE
@@ -546,12 +563,18 @@ void parseSlots(int idx, String json) {
           }
         }
       }
-      tempSlots[tempCount++] = {sh, sm, eh, em, isRecurring, isActivated, isExpired, slotDaysMask};
+      if (!isDeleted) {
+        // char[] can't be filled via the brace initializer above, so set the
+        // scalar fields there and copy slotTs in as a separate step.
+        tempSlots[tempCount] = {sh, sm, eh, em, isRecurring, isActivated, isExpired, slotDaysMask};
+        slotTsStr.toCharArray(tempSlots[tempCount].slotTs, sizeof(tempSlots[tempCount].slotTs));
+        tempCount++;
+      }
     }
     pos = max(si, ei) + 10;
   }
 
-  if (tempCount > 0 || json == "[]") {
+  if (tempCount > 0 || json == "[]" || sawSlotObject) {
     rooms[idx].slotCount = tempCount;
     for (int i = 0; i < tempCount; i++) rooms[idx].slots[i] = tempSlots[i];
     mergeSlots(idx);
@@ -783,25 +806,34 @@ void refreshSlotsOnly() {
       // Save previous state for comparison
       int  prevCount = rooms[i].slotCount;
       bool prevActivated[10] = {};
-      for (int j = 0; j < rooms[i].slotCount && j < 10; j++)
+      char prevSlotTs[10][16] = {{0}};
+      for (int j = 0; j < rooms[i].slotCount && j < 10; j++) {
         prevActivated[j] = rooms[i].slots[j].activated;
+        strncpy(prevSlotTs[j], rooms[i].slots[j].slotTs, sizeof(prevSlotTs[j]));
+      }
 
       parseSlots(i, slotJson);
 
-      // Re-apply if slot count changed OR any activation flag changed
-      bool activationChanged = false;
+      // Re-apply if slot count changed, any activation flag changed, or any
+      // slot's own slotTs changed. slotTs is the PWA's per-slot "this
+      // content was touched" marker (written on every create/edit, e.g. a
+      // time-range or code change) -- comparing it catches edits the
+      // activation-only check above would otherwise miss, since editing a
+      // slot's time doesn't necessarily also change whether it's activated.
+      bool needsReapply = false;
       if (rooms[i].slotCount != prevCount) {
-        activationChanged = true;
+        needsReapply = true;
       } else {
         for (int j = 0; j < rooms[i].slotCount; j++) {
-          if (rooms[i].slots[j].activated != prevActivated[j]) {
-            activationChanged = true;
+          if (rooms[i].slots[j].activated != prevActivated[j] ||
+              strcmp(rooms[i].slots[j].slotTs, prevSlotTs[j]) != 0) {
+            needsReapply = true;
             break;
           }
         }
       }
 
-      if (activationChanged) {
+      if (needsReapply) {
         applyState(i);
       }
     }
@@ -1139,6 +1171,9 @@ bool midnightRollover() {
       String existingSlot = fbGet(base + "/slots/" + String(j));
       if (existingSlot == "error" || existingSlot == "null" || existingSlot.length() < 5) continue;
       if (extractStringField(existingSlot, "date") != todayDateStr) continue; // not today — genuinely stale, drop it
+      // Soft-deleted (PWA's deleteSlot()) — this is the permanent purge the
+      // tombstone was waiting for: just don't carry it into the new today.
+      if (existingSlot.indexOf("\"deleted\":true") >= 0) continue;
       if (!first) newTodayJson += ",";
       newTodayJson += existingSlot;
       first = false;
@@ -1157,8 +1192,10 @@ bool midnightRollover() {
         int objEnd   = tomorrowJson.indexOf('}', ei);
         if (objStart >= 0 && objEnd >= 0) {
           String obj = tomorrowJson.substring(objStart, objEnd + 1);
-          // Only move one-time slots (skip recurring)
-          if (obj.indexOf("\"recurring\":true") < 0) {
+          // Only move one-time, non-deleted slots (skip recurring, and skip a
+          // soft-deleted tomorrow slot — that's this tombstone's permanent
+          // purge, same as the "keep today's slots" loop above).
+          if (obj.indexOf("\"recurring\":true") < 0 && obj.indexOf("\"deleted\":true") < 0) {
             String startStr = tomorrowJson.substring(si + 5, si + 10);
             String endStr   = tomorrowJson.substring(ei + 5, ei + 10);
             if (!first) newTodayJson += ",";
@@ -1695,30 +1732,45 @@ void setup() {
   // specifically to survive that gap. Only run this when NTP actually
   // synced — comparing against an unsynced clock (epoch 0) would
   // otherwise look like a huge missed gap on every boot and wrongly wipe
-  // active slots. If this fails too (e.g. WiFi still isn't up yet),
-  // checkMidnight() will keep retrying every minute once loop() starts —
-  // see its comment.
+  // active slots. If NTP hasn't synced yet, this same check runs again
+  // from loop()'s NTP retry the moment it eventually does — see there.
   if (timeSynced) {
-    int todayEpochDay = currentEpochDay();
-    if (lastRolloverDay == -1) {
-      // No baseline yet (first boot on this firmware, or ever) — nothing to
-      // catch up on, just record today so future boots have something to
-      // compare against.
-      lastRolloverDay = todayEpochDay;
-      saveConfig();
-    } else if (todayEpochDay != lastRolloverDay) {
-      if (syncRolloverMarkerFromFirebase(todayEpochDay)) {
-        Serial.println("Rollover already done today via PWA — syncing marker");
-      } else {
-        Serial.println("Missed rollover while offline — catching up now");
-        midnightRollover(); // updates lastRolloverDay + saveConfig() itself
-      }
-    }
+    catchUpMissedRollover();
   } else {
-    Serial.println("NTP never synced — skipping missed-rollover check this boot");
+    Serial.println("NTP never synced at boot — will keep retrying in the background; rollover catch-up runs once it succeeds");
   }
 
   Serial.println("=== Ready — state restored from Firebase ===");
+}
+
+// Runs the exact "did we miss a rollover" check setup() runs at boot, but
+// callable again later once a delayed NTP sync finally succeeds (see the
+// retry in loop()) -- factored out so both call sites share one path
+// rather than two copies that could drift apart. Only ever called with
+// timeSynced already true -- an unsynced clock's epoch day is meaningless
+// and would look like a huge missed gap, wrongly wiping active slots.
+// Safe to call even when nothing was actually missed: syncRolloverMarkerFromFirebase()
+// and midnightRollover()'s own date-based keep-filter mean this can never
+// clobber a slot legitimately created for today while this board's clock
+// was still unsynced.
+void catchUpMissedRollover() {
+  int todayEpochDay = currentEpochDay();
+  if (lastRolloverDay == -1) {
+    // No baseline yet (first boot on this firmware, or ever) — nothing to
+    // catch up on, just record today so future checks have something to
+    // compare against.
+    lastRolloverDay = todayEpochDay;
+    saveConfig();
+    return;
+  }
+  if (todayEpochDay != lastRolloverDay) {
+    if (syncRolloverMarkerFromFirebase(todayEpochDay)) {
+      Serial.println("Rollover already done today via PWA — syncing marker");
+    } else {
+      Serial.println("Missed rollover while offline — catching up now");
+      midnightRollover(); // updates lastRolloverDay + saveConfig() itself
+    }
+  }
 }
 
 // ── Loop ──────────────────────────────────────────────────────
@@ -1733,6 +1785,24 @@ void loop() {
   // Check schedule every 10 seconds
   if (millis() - lastScheduleCheck > SCHEDULE_INTERVAL) {
     lastScheduleCheck = millis();
+
+    // NTP is a one-shot attempt at boot (20 tries over ~10s) — if the
+    // network wasn't fully up yet (e.g. a power outage where the local
+    // WiFi reconnects before the router's own internet uplink does),
+    // timeSynced stays false for the rest of this boot with nothing ever
+    // retrying it, and checkMidnight() below silently never runs at all.
+    // Retry here on the same 10s cadence, WiFi permitting; the instant it
+    // succeeds, run the same missed-rollover catch-up setup() runs at
+    // boot, so a slow network recovery doesn't cost a whole reboot cycle.
+    if (!timeSynced && WiFi.status() == WL_CONNECTED) {
+      struct tm t;
+      timeSynced = getLocalTime(&t);
+      if (timeSynced) {
+        Serial.println("NTP synced (delayed) — Time: " + getTime());
+        catchUpMissedRollover();
+      }
+    }
+
     checkSchedules();
     checkEndOfSlotWarnings(); // update per-room warning flags, fire beeper burst on entry
     checkMidnight();  // detect date change → rollover slots

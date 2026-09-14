@@ -234,7 +234,7 @@ async function loadAvailability() {
       const buildOccupied = (slots, weekday) => {
         const occ = new Array(24).fill(false);
         normalizeArr(slots).forEach(sl => {
-          if (!sl || !sl.s || !sl.e) return;
+          if (!sl || !sl.s || !sl.e || sl.deleted) return;
           if (sl.recurring && Array.isArray(sl.days) && sl.days.length && !sl.days.includes(weekday)) return;
           const si = Math.floor(toMins(sl.s) / 60);
           const ei = Math.ceil(toMins(sl.e) / 60);
@@ -363,7 +363,7 @@ async function declineSiblingRequestsPublic(confirmedReq, excludeId) {
 async function tryAutoApprove(id, room, opt, reqObj) {
   const bucketPath = '/rooms/room' + room.id + (opt.dayIdx === 0 ? '/slots' : '/slotsT');
   const arr = normalizeArr(await fbGet(bucketPath));
-  const collision = arr.some(sl => sl && sl.s === opt.s && sl.e === opt.e);
+  const collision = arr.some(sl => sl && !sl.deleted && sl.s === opt.s && sl.e === opt.e);
   if (collision) {
     await fbPut('/requests/' + id, { ...reqObj, status: 'declined', declinedAt: Date.now(), declinedReason: 'slot_taken' });
     return false;
@@ -390,8 +390,14 @@ async function tryAutoApprove(id, room, opt, reqObj) {
   return true;
 }
 
+let submitInFlight = false; // guards against a double-tap on Submit firing
+                             // two requests (and, under auto-approve, two
+                             // racing tryAutoApprove() calls) — selectedOption
+                             // is never cleared, so nothing else stops it.
+
 async function submitRequest() {
   if (!selectedOption) return;
+  if (submitInFlight) return;
   const name  = document.getElementById('reqName').value.trim();
   const phone = document.getElementById('reqPhone').value.trim();
   if (!name) { document.getElementById('formError').textContent = 'Please enter your name'; return; }
@@ -400,58 +406,63 @@ async function submitRequest() {
     return;
   }
 
-  const { room, opt } = selectedOption;
-  const id = makeRequestId();
-  const reqObj = {
-    roomId: room.id,
-    roomName: room.name,
-    date: opt.date,
-    dayIdx: opt.dayIdx,
-    s: opt.s,
-    e: opt.e,
-    name,
-    phone: phone.replace(/[^\d]/g, ''),
-    status: 'open',
-    createdAt: Date.now()
-  };
-  const ok = await fbPut('/requests/' + id, reqObj);
+  submitInFlight = true;
+  try {
+    const { room, opt } = selectedOption;
+    const id = makeRequestId();
+    const reqObj = {
+      roomId: room.id,
+      roomName: room.name,
+      date: opt.date,
+      dayIdx: opt.dayIdx,
+      s: opt.s,
+      e: opt.e,
+      name,
+      phone: phone.replace(/[^\d]/g, ''),
+      status: 'open',
+      createdAt: Date.now()
+    };
+    const ok = await fbPut('/requests/' + id, reqObj);
 
-  if (!ok) {
-    document.getElementById('formError').textContent = 'Network error — please try again';
-    return;
-  }
-
-  document.getElementById('formOverlay').classList.remove('show');
-
-  // Auto-approve: try to confirm immediately. If the slot turned out to
-  // already be taken, tell the visitor instead of showing a false success
-  // and refresh the list so they can pick something else.
-  const autoApprove = await fbGet('/config/autoApproveBookings');
-  if (autoApprove === true) {
-    const booked = await tryAutoApprove(id, room, opt, reqObj);
-    if (!booked) {
-      document.getElementById('loadingState').style.display = 'none';
-      document.getElementById('slotList').innerHTML =
-        `<div class="no-slots">Sorry — that slot was just taken by someone else.<br>
-          <span style="font-size:12px;color:var(--muted);margin-top:8px;display:block">Please pick another below.</span>
-        </div>`;
-      await loadAvailability();
+    if (!ok) {
+      document.getElementById('formError').textContent = 'Network error — please try again';
       return;
     }
-    document.getElementById('successSub').textContent =
-      `${room.name} · ${opt.s} – ${opt.e} (${opt.label}) — code required at the room`;
-    document.getElementById('successOverlay').querySelector('.success-text').textContent = 'Booking confirmed!';
-  } else {
-    document.getElementById('successSub').textContent =
-      `${room.name} · ${opt.s} – ${opt.e} (${opt.label})`;
-    document.getElementById('successOverlay').querySelector('.success-text').textContent = 'Request sent!';
-  }
 
-  document.getElementById('successOverlay').classList.add('show');
-  setTimeout(() => {
-    document.getElementById('successOverlay').classList.remove('show');
-    closePage('submitted');
-  }, 4000);
+    document.getElementById('formOverlay').classList.remove('show');
+
+    // Auto-approve: try to confirm immediately. If the slot turned out to
+    // already be taken, tell the visitor instead of showing a false success
+    // and refresh the list so they can pick something else.
+    const autoApprove = await fbGet('/config/autoApproveBookings');
+    if (autoApprove === true) {
+      const booked = await tryAutoApprove(id, room, opt, reqObj);
+      if (!booked) {
+        document.getElementById('loadingState').style.display = 'none';
+        document.getElementById('slotList').innerHTML =
+          `<div class="no-slots">Sorry — that slot was just taken by someone else.<br>
+            <span style="font-size:12px;color:var(--muted);margin-top:8px;display:block">Please pick another below.</span>
+          </div>`;
+        await loadAvailability();
+        return;
+      }
+      document.getElementById('successSub').textContent =
+        `${room.name} · ${opt.s} – ${opt.e} (${opt.label}) — code required at the room`;
+      document.getElementById('successOverlay').querySelector('.success-text').textContent = 'Booking confirmed!';
+    } else {
+      document.getElementById('successSub').textContent =
+        `${room.name} · ${opt.s} – ${opt.e} (${opt.label})`;
+      document.getElementById('successOverlay').querySelector('.success-text').textContent = 'Request sent!';
+    }
+
+    document.getElementById('successOverlay').classList.add('show');
+    setTimeout(() => {
+      document.getElementById('successOverlay').classList.remove('show');
+      closePage('submitted');
+    }, 4000);
+  } finally {
+    submitInFlight = false;
+  }
 }
 
 // ── Boot ──────────────────────────────────────────────────────

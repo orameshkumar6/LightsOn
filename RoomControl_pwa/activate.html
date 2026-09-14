@@ -298,8 +298,11 @@ async function loadSlots() {
           .map(k => rawSlots[k]);
       }
 
-      // Only valid slots with s and e fields
-      const slots = slotsArr.filter(s => s && s.s && s.e);
+      // Only valid, non-deleted slots with s and e fields — a soft-deleted
+      // slot (see index.html's deleteSlot()) must never be offered for
+      // activation even though it's still present in Firebase awaiting the
+      // next rollover's permanent purge.
+      const slots = slotsArr.filter(s => s && s.s && s.e && !s.deleted);
 
       // Carries a slot's Firebase bucket + index along so activation writes
       // and the "preserve state from the previous load" match below can
@@ -348,7 +351,7 @@ async function loadSlots() {
         if (Array.isArray(rawSlotsT)) slotsTArr = rawSlotsT;
         else if (rawSlotsT) slotsTArr = Object.keys(rawSlotsT).sort((a,b)=>parseInt(a)-parseInt(b)).map(k => rawSlotsT[k]);
         const tomorrowWd = (new Date().getDay() + 1) % 7;
-        slotsTArr.filter(s => s && s.s && s.e).forEach((sl, originalIndex) => {
+        slotsTArr.filter(s => s && s.s && s.e && !s.deleted).forEach((sl, originalIndex) => {
           if (toMins(sl.s) > wrappedEndMins) return; // starts beyond the window's tomorrow portion
           if (sl.recurring && Array.isArray(sl.days) && sl.days.length &&
               !sl.days.includes(tomorrowWd)) return;
