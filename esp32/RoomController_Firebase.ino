@@ -1438,8 +1438,17 @@ bool inWarningWindow(int idx) {
     // Don't warn for a recurring slot that isn't scheduled today — same
     // day-of-week gate isInSlot() applies.
     if (rooms[idx].slots[j].recurring && !slotRunsToday(rooms[idx].slots[j])) continue;
+    int s = rooms[idx].slots[j].sh * 60 + rooms[idx].slots[j].sm;
     int e = rooms[idx].slots[j].eh * 60 + rooms[idx].slots[j].em;
-    if (nm >= e - warnMinutes && nm < e) return true;
+    // The slot must actually be running right now — same nm >= s && nm < e
+    // check isInSlot() uses to decide the room is on. Without this, a slot
+    // pre-activated (via the lookahead window) before it starts could match
+    // the warning window purely on time-of-day whenever warnMinutes is as
+    // long as (or longer than) the slot's own duration — e - warnMinutes
+    // then falls before s, firing the beeper for a slot that hasn't started
+    // and a room that's correctly still off.
+    if (nm < s || nm >= e) continue;
+    if (nm >= e - warnMinutes) return true;
   }
   return false;
 }
