@@ -396,7 +396,13 @@ async function tryAutoApprove(id, room, opt, reqObj) {
     bookedBy: reqObj.name, phone: reqObj.phone,
     slotTs: Date.now()
   };
-  const ok = await fbPut(bucketPath + '/' + arr.length, newSlot);
+  // Today's bucket also bumps slotsUpdatedAt — the marker the ESP32's
+  // refreshSlotsOnly() checks before paying for the full /slots download
+  // (see writeRoomSlots() in index.html for the full reasoning). Tomorrow's
+  // bucket doesn't need it; the ESP32 doesn't poll /slotsT routinely.
+  const ok = opt.dayIdx === 0
+    ? await fbPatch('/rooms/room' + room.id, { [`slots/${arr.length}`]: newSlot, slotsUpdatedAt: Date.now() })
+    : await fbPut(bucketPath + '/' + arr.length, newSlot);
   if (!ok) return false;
 
   await fbPut('/requests/' + id, {

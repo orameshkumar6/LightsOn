@@ -562,6 +562,18 @@ async function pinSubmit() {
       // Write activatedAt to Firebase — bucket is 'slots' or 'slotsT'
       // depending on which one this slot was loaded from (see loadSlots).
       const slotBasePath = `/rooms/${selectedSlot.roomKey}/${selectedSlot.bucket || 'slots'}/${selectedSlot.origIdx}`;
+      // Bump slotsUpdatedAt too — the marker the ESP32's refreshSlotsOnly()
+      // checks before paying for the full /slots download (see
+      // writeRoomSlots() in index.html for the full reasoning). Only for
+      // the 'slots' (today) bucket — the ESP32 doesn't poll /slotsT
+      // routinely, so a tomorrow-bucket activation doesn't need it. Written
+      // BEFORE the data fields, fail-safe: if a later PUT below fails, the
+      // marker having already moved just costs one extra full re-read next
+      // cycle, never a missed one — the direction that matters here, since
+      // this is literally the write that turns the light on.
+      if ((selectedSlot.bucket || 'slots') !== 'slotsT') {
+        await fbPut(`/rooms/${selectedSlot.roomKey}/slotsUpdatedAt`, Date.now());
+      }
       await fbPut(slotBasePath + '/activatedAt', Date.now());
       await fbPut(slotBasePath + '/activatedBy', isAdmin ? 'admin' : 'slot');
       await fbPut(slotBasePath + '/attempts',    0);

@@ -176,6 +176,14 @@ struct Room {
 Room rooms[MAX_ROOMS];
 int  roomCount = 0;  // how many rooms were actually found in Firebase at boot (<= MAX_ROOMS)
 
+// Per-room cache of the last-seen /rooms/roomN/slotsUpdatedAt value —
+// refreshSlotsOnly() checks this cheap marker before paying for the full
+// /slots download. Every writer that touches a room's /slots bumps this
+// same field (the PWA's writeRoomSlots() helper; this firmware's own
+// midnightRollover()/markSlotExpired()) — see refreshSlotsOnly() for why an
+// empty/unset marker must never be treated as "unchanged".
+String lastSlotsMarker[MAX_ROOMS];
+
 unsigned long lastPollTime      = 0;
 unsigned long lastScheduleCheck = 0;
 unsigned long lastSlotRefresh   = 0;
@@ -801,6 +809,18 @@ void readAllRooms() {
 // KEY FIX: separate from applyState so slot update never causes flicker
 void refreshSlotsOnly() {
   for (int i = 0; i < roomCount; i++) {
+    // Cheap check first: only pay for the full /slots download when this
+    // room's marker actually moved since we last looked. An empty/"null"
+    // marker (a room that predates this feature, or hasn't had its first
+    // post-deploy write yet) never counts as "unchanged" — that would skip
+    // the very first real read.
+    String marker = fbGet("/rooms/room" + String(i+1) + "/slotsUpdatedAt");
+    if (marker != "error" && marker != "" && marker != "null" && marker == lastSlotsMarker[i]) {
+      warningAwareDelay(150);
+      continue;
+    }
+    if (marker != "error") lastSlotsMarker[i] = marker;
+
     String slotJson = fbGet("/rooms/room" + String(i+1) + "/slots");
     if (slotJson != "error") {
       // Save previous state for comparison
@@ -1250,6 +1270,16 @@ bool midnightRollover() {
     }
     newTomorrowJson += "]";
 
+    // Marker written BEFORE the data — fail-safe ordering: if the /slots
+    // write below fails, "marker says changed but data didn't move" just
+    // costs refreshSlotsOnly() one wasted full re-fetch next cycle, never a
+    // missed one. Not load-bearing for THIS firmware's own correctness
+    // (readAllRooms() right after this function returns already refreshes
+    // everything unconditionally) — this is for any other reader/hygiene.
+    String newMarker = String((unsigned long)time(nullptr));
+    fbPut(base + "/slotsUpdatedAt", newMarker);
+    lastSlotsMarker[i] = newMarker;
+
     bool ok1 = fbPut(base + "/slots",  newTodayJson);
     bool ok2 = fbPut(base + "/slotsT", newTomorrowJson);
     allOk = allOk && ok1 && ok2;
@@ -1350,8 +1380,16 @@ void markSlotExpired(int roomIdx, int slotIdx) {
   // Never expire a slot that's currently activated — the firmware already
   // tracks this per slot, so we don't need to fetch/parse the array to know it.
   if (rooms[roomIdx].slots[slotIdx].activated) return;
-  String path = "/rooms/room" + String(roomIdx + 1) + "/slots/" + String(slotIdx) + "/expired";
-  fbPut(path, "true");
+  String base = "/rooms/room" + String(roomIdx + 1);
+  // Marker before data — same fail-safe ordering as midnightRollover(), and
+  // likewise not load-bearing for this firmware's own correctness (the
+  // caller already latched rooms[roomIdx].slots[slotIdx].expired locally
+  // before calling this) — just keeps slotsUpdatedAt honest for any other
+  // reader.
+  String newMarker = String((unsigned long)time(nullptr));
+  fbPut(base + "/slotsUpdatedAt", newMarker);
+  lastSlotsMarker[roomIdx] = newMarker;
+  fbPut(base + "/slots/" + String(slotIdx) + "/expired", "true");
   char startBuf[6], endBuf[6];
   snprintf(startBuf, 6, "%02d:%02d", rooms[roomIdx].slots[slotIdx].sh, rooms[roomIdx].slots[slotIdx].sm);
   snprintf(endBuf,   6, "%02d:%02d", rooms[roomIdx].slots[slotIdx].eh, rooms[roomIdx].slots[slotIdx].em);
