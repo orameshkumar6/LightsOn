@@ -3590,8 +3590,20 @@ function markRoomDirty(idx) {
 // not merged into whatever's already at that index. One request; Firebase
 // applies a multi-path PATCH atomically, so the marker can never land
 // without the data it describes, or vice versa.
+// Global "did anything change that a visitor's request.html availability
+// view depends on" marker — separate from slotsUpdatedAt (which is per-room
+// and /slots-only, for the ESP32). loadAvailability() checks this before
+// paying for a full /rooms fetch, so it must be bumped by anything that
+// affects today/tomorrow's occupied hours in ANY room: every /slots write
+// (via writeRoomSlots below) and every /slotsT write. Written before the
+// data it describes, same fail-safe reasoning as slotsUpdatedAt.
+async function bumpRoomsUpdatedAt(p) {
+  return fbPatch('/config', { roomsUpdatedAt: Date.now() }, p);
+}
+
 async function writeRoomSlots(roomId, slotsByIndex, p, extraFields) {
   if (Object.keys(slotsByIndex).length === 0 && !extraFields) return true;
+  await bumpRoomsUpdatedAt(p);
   const flat = {};
   Object.keys(slotsByIndex).forEach(idx => { flat[`slots/${idx}`] = slotsByIndex[idx]; });
   if (extraFields) Object.assign(flat, extraFields);
@@ -3902,6 +3914,7 @@ async function pushRoom(idx, profile) {
       days: (sl.recurring && Array.isArray(sl.days) && sl.days.length) ? sl.days : null
     };
   });
+  await bumpRoomsUpdatedAt(p); // slotsT changed — request.html's availability view needs to know
   ok = await fbPatch(roomBase, { slotsT }, p) && ok;
 
   // ── Recurring definitions — merge by id, optimistic-lock by defTs ─────
@@ -4694,6 +4707,7 @@ async function copySlots(fromId) {
         id: sl.id, slotTs: sl.slotTs,
         s: sl.s, e: sl.e, recurring: sl.recurring, code: sl.code, date: sl.date
       }));
+      await bumpRoomsUpdatedAt(p); // slotsT changed — request.html's availability view needs to know
       await fbPatch(`/rooms/room${toId}`, { slotsT }, p);
     }
 

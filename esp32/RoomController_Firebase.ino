@@ -1144,6 +1144,14 @@ bool midnightRollover() {
   Serial.println("=== Midnight rollover ===");
   bool allOk = true;
 
+  // Global marker (not per-room, unlike slotsUpdatedAt) — request.html's
+  // loadAvailability() checks this once before fetching every room, so one
+  // write covering the whole rollover is enough. Written before any of the
+  // per-room work below, same fail-safe reasoning as slotsUpdatedAt: if
+  // rollover fails partway through, a visitor doing one wasted-but-safe
+  // extra fetch is fine, missing a real change is not.
+  fbPut("/config/roomsUpdatedAt", String((unsigned long)time(nullptr)));
+
   for (int i = 0; i < roomCount; i++) {
     String base = "/rooms/room" + String(i + 1);
 

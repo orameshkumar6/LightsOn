@@ -142,6 +142,11 @@ const PROFILE_PREFIX = PROFILE_NUM ? '/profiles/' + PROFILE_NUM : '';
 let allRooms = [];       // [{id, name, options:[{date, dayIdx, s, e}]}]
 let selectedOption = null;
 let loadingSlots = false;
+// Last-seen /config/roomsUpdatedAt — loadAvailability() skips its full
+// /rooms fetch when this hasn't moved. Sentinel a real marker (a number or
+// null-from-unset-config) can never equal, so the very first call always
+// falls through to a real fetch.
+let lastRoomsMarker = '__unset__';
 
 // ── Helpers ───────────────────────────────────────────────────
 function toMins(t) { const [h,m]=t.split(':').map(Number); return h*60+m; }
@@ -224,6 +229,15 @@ async function loadAvailability() {
   loadingSlots = true;
 
   try {
+    // Cheap check first: skip the full /rooms download entirely when
+    // nothing has changed anywhere since the last poll. null is never
+    // treated as "unchanged" — an unset /config/roomsUpdatedAt (predates
+    // this feature, or genuinely nothing has ever written it) must not
+    // block the very first real read.
+    const marker = await fbGet('/config/roomsUpdatedAt');
+    if (marker !== null && marker === lastRoomsMarker) return;
+    lastRoomsMarker = marker;
+
     const rooms = await fbGet('/rooms');
     if (!rooms) {
       document.getElementById('loadingState').style.display = 'none';
@@ -396,10 +410,16 @@ async function tryAutoApprove(id, room, opt, reqObj) {
     bookedBy: reqObj.name, phone: reqObj.phone,
     slotTs: Date.now()
   };
-  // Today's bucket also bumps slotsUpdatedAt — the marker the ESP32's
-  // refreshSlotsOnly() checks before paying for the full /slots download
-  // (see writeRoomSlots() in index.html for the full reasoning). Tomorrow's
-  // bucket doesn't need it; the ESP32 doesn't poll /slotsT routinely.
+  // /config/roomsUpdatedAt is the global marker loadAvailability() checks
+  // before paying for a full /rooms fetch (see bumpRoomsUpdatedAt() in
+  // index.html for the full reasoning) — bumped either way, since a new
+  // slot in EITHER bucket changes what a visitor sees. Written before the
+  // slot data itself, fail-safe (a failed data write below then just costs
+  // one wasted-but-safe extra fetch, never a missed one).
+  await fbPatch('/config', { roomsUpdatedAt: Date.now() });
+  // Today's bucket ALSO bumps slotsUpdatedAt — the separate, /slots-only
+  // marker the ESP32's refreshSlotsOnly() checks. Tomorrow's bucket doesn't
+  // need that one; the ESP32 doesn't poll /slotsT routinely.
   const ok = opt.dayIdx === 0
     ? await fbPatch('/rooms/room' + room.id, { [`slots/${arr.length}`]: newSlot, slotsUpdatedAt: Date.now() })
     : await fbPut(bucketPath + '/' + arr.length, newSlot);
