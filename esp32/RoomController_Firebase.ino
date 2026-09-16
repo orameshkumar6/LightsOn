@@ -101,6 +101,14 @@ int emergencyPin = PIN_NONE;
 // re-toggling every tick, and cleared when standby ends (a room comes on).
 int  emergencyTimeoutMin  = 0;      // 0 = disabled
 unsigned long emergencyOnSince = 0; // millis() when the light last turned ON
+// Last level actually written to emergencyPin. -1 = never written yet, so
+// the first real update always goes through. updateEmergencyLight() re-runs
+// its validation (all-rooms-off check, timeout comparison) far more often
+// than the pin's desired state actually changes — every room settling,
+// every loop tick — so writing digitalWrite() unconditionally on every one
+// of those re-checks touches the pin redundantly the whole time it's
+// sitting still validated-but-unchanged. See setEmergencyPin() below.
+int lastEmergencyPinLevel = -1;
 bool emergencyLatchedOff  = false;  // true = timed out, held off until re-arm
 
 // ── End-of-slot warning — shared beeper + per-room LED blink ──
@@ -688,6 +696,18 @@ void applyBeepConfig() {
   Serial.printf("Beep pattern: %lu ms x %d%s\n", beepOnMs, beepBurstCount, beepBurstCount == 0 ? " (muted)" : "");
 }
 
+// Only actually touches the pin when the desired level differs from what
+// was last written — updateEmergencyLight() re-validates (all-rooms-off
+// check, timeout comparison) far more often than the answer actually
+// changes, so calling digitalWrite() unconditionally on every one of those
+// re-checks was toggling the pin the whole time it sat there
+// validated-but-unchanged.
+void setEmergencyPin(int level) {
+  if (level == lastEmergencyPinLevel) return;
+  digitalWrite(emergencyPin, level);
+  lastEmergencyPinLevel = level;
+}
+
 // Recomputed after every room state change (called from setRelay(), the
 // single funnel every schedule/override/activation change already goes
 // through) — ON only when every known room is currently OFF.
@@ -701,7 +721,7 @@ void updateEmergencyLight() {
   if (!allOff) {
     // A room is on → emergency light off, and reset the standby timer + latch
     // so the timeout re-arms for the NEXT all-off period (re-arm on activity).
-    digitalWrite(emergencyPin, RELAY_OFF);
+    setEmergencyPin(RELAY_OFF);
     emergencyOnSince = 0;
     emergencyLatchedOff = false;
     return;
@@ -710,7 +730,7 @@ void updateEmergencyLight() {
   // All rooms are off → the emergency light wants to be ON.
   if (emergencyTimeoutMin <= 0) {
     // No timeout configured — original always-on-while-standby behaviour.
-    digitalWrite(emergencyPin, RELAY_ON);
+    setEmergencyPin(RELAY_ON);
     return;
   }
 
@@ -721,16 +741,16 @@ void updateEmergencyLight() {
   }
   // If we've already timed out this standby period, keep it off.
   if (emergencyLatchedOff) {
-    digitalWrite(emergencyPin, RELAY_OFF);
+    setEmergencyPin(RELAY_OFF);
     return;
   }
   // Still within the allowed window → on; past it → latch off.
   if (millis() - emergencyOnSince >= (unsigned long)emergencyTimeoutMin * 60000UL) {
     emergencyLatchedOff = true;
-    digitalWrite(emergencyPin, RELAY_OFF);
+    setEmergencyPin(RELAY_OFF);
     Serial.printf("[%s] Emergency light auto-off after %d min standby\n", getTime().c_str(), emergencyTimeoutMin);
   } else {
-    digitalWrite(emergencyPin, RELAY_ON);
+    setEmergencyPin(RELAY_ON);
   }
 }
 
