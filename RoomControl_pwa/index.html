@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- RoomController v2.3 - build 2026-08-10-B -->
+<!-- RoomController v2.4 - slot-count + activation-isolation fixes 2026-09-27 -->
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -1658,8 +1658,13 @@ async function saveRecurringFromModal() {
     if (recEditingDefId) {
       const d = r.recurringDefs.find(x => x.id === recEditingDefId);
       if (d) {
+        // Capture whether the secret code changed BEFORE mutating the definition.
+        // Re-materialization uses this one-shot flag to reset activation only
+        // for occurrences whose credential really changed.
+        const previousCode = d.code || null;
         d.s = s; d.e = e; d.days = days; d.code = code;
         d.bookedBy = bookedBy; d.phone = phone; d.paid = paid;
+        d._codeChanged = previousCode !== (code || null);
         changedDef = d;
         recurringOperation = 'update';
       }
@@ -1696,17 +1701,24 @@ async function saveRecurringFromModal() {
 // definition add/edit so the buckets reflect the current defs without waiting
 // for the next rollover.
 function rematerializeRecurringBuckets(r) {
-  const todayWd    = new Date().getDay();
+  const todayWd = new Date().getDay();
   const tomorrowWd = (todayWd + 1) % 7;
   const defs = Array.isArray(r.recurringDefs) ? r.recurringDefs : [];
-  const oneTimeToday    = normalizeSlots(r.slots[0]).filter(sl => !sl.recurring);
-  const oneTimeTomorrow = normalizeSlots(r.slots[1]).filter(sl => !sl.recurring);
-  const recToday = defs.filter(d => recurringRunsOnDay(d, todayWd)).map(d => materializeRecurringSlot(d, todayStr()));
-  const recTomorrow = defs.filter(d => recurringRunsOnDay(d, tomorrowWd)).map(d => materializeRecurringSlot(d, tomorrowDateStr()));
+  const currentToday = normalizeSlots(r.slots[0]);
+  const currentTomorrow = normalizeSlots(r.slots[1]);
+  const oneTimeToday = currentToday.filter(sl => !sl.recurring);
+  const oneTimeTomorrow = currentTomorrow.filter(sl => !sl.recurring);
+  const todayDate = todayStr();
+  const tomorrowDate = tomorrowDateStr();
+  const findOccurrence = (list, def, dateStr) => list.find(sl => sl && sl.recurring && sl.defId === def.id && sl.date === dateStr);
+  const recToday = defs.filter(d => recurringRunsOnDay(d, todayWd))
+    .map(d => materializeRecurringSlot(d, todayDate, findOccurrence(currentToday, d, todayDate)));
+  const recTomorrow = defs.filter(d => recurringRunsOnDay(d, tomorrowWd))
+    .map(d => materializeRecurringSlot(d, tomorrowDate, findOccurrence(currentTomorrow, d, tomorrowDate)));
   r.slots[0] = [...recToday, ...oneTimeToday];
   r.slots[1] = [...recTomorrow, ...oneTimeTomorrow];
+  defs.forEach(d => { delete d._codeChanged; });
 }
-
 // ── Slot Modal ────────────────────────────────────────────────
 let modalRoomId  = null;
 let modalDay     = 0;
@@ -3672,20 +3684,14 @@ async function publishRoomSnapshotSyncV2(room, profile, reason) {
     id:room.id, name:room.name || `Room ${room.id}`,
     relayPin:room.relayPin ?? null, ledPin:room.ledPin ?? null, updatedAt:now
   };
-  const addSlots = (list,bucket) => (list || []).forEach(slot => {
-    if (!slot || !slot.id) return;
-    patch[`slotRecords/room${room.id}/${bucket}/${slot.id}`] = {
-      ...slot, version:Number(slot.version || 1), updatedAt:Number(slot.updatedAt || slot.slotTs || now), deleted:!!slot.deleted
-    };
-  });
-  addSlots(room.slots && room.slots[0], 'today');
-  addSlots(room.slots && room.slots[1], 'tomorrow');
-  (room.recurringDefs || []).forEach(def => {
-    if (!def || !def.id) return;
-    patch[`recurringDefs/room${room.id}/${def.id}`] = {
-      ...def, version:Number(def.version || 1), updatedAt:Number(def.updatedAt || def.defTs || now), deleted:!!def.deleted
-    };
-  });
+
+  // IMPORTANT: a room snapshot is metadata/refresh notification only.
+  // Do NOT republish cached slot bodies here. Slot bodies contain activation
+  // authority (activatedAt/activatedBy/attempts/lockedUntil) and writing an
+  // older local copy can overwrite a newer targeted activate/deactivate write.
+  // Slot mutations are published only through publishSlotSyncV2().
+  // Recurring definitions are published only through publishRecurringDefSyncV2().
+
   patch[`sync/changes/${revision}`] = {
     entity:'roomSnapshot', operation:'refresh', roomId:room.id,
     recordId:`room${room.id}`, reason:reason || 'room_snapshot',
@@ -4256,27 +4262,34 @@ function harvestRecurringDefs(r) {
 // Materialize a recurring definition into a concrete day-slot for dateStr.
 // Carries the def's stable code + booker/phone, links back via defId, and
 // resets activation (fresh instance for a new day).
-function materializeRecurringSlot(def, dateStr) {
+function recurringOccurrenceId(def, dateStr) {
+  return `rec_${def.id}_${dateStr}`;
+}
+function materializeRecurringSlot(def, dateStr, previousSlot) {
+  const sameOccurrence = !!(previousSlot && previousSlot.recurring && previousSlot.defId === def.id && previousSlot.date === dateStr);
+  const codeChanged = !!def._codeChanged;
+  const autoActivate = !def.code;
+  const now = Date.now();
+  // A changed secret invalidates the old activation/PIN-attempt state. Other
+  // edits (name, phone, payment, weekday metadata) preserve occurrence state.
+  const preserveState = sameOccurrence && !codeChanged;
   return {
-    id: makeSlotId(),
-    s: def.s, e: def.e,
-    recurring: true,
-    defId: def.id,
+    id: recurringOccurrenceId(def, dateStr),
+    s: def.s, e: def.e, recurring: true, defId: def.id,
     days: Array.isArray(def.days) ? [...def.days] : [],
-    code: def.code || null,
-    bookedBy: def.bookedBy || null,
-    phone: def.phone || null,
-    paid: !!def.paid,
-    // No-code recurring instances are auto-active (light on for their window
-    // each day); coded ones wait for activation. Matches one-time slot rule.
-    activatedAt: (def.code ? null : Date.now()),
-    activatedBy: (def.code ? null : 'auto'),
-    attempts: 0, lockedUntil: null, expired: false,
-    _fresh: true,
+    code: def.code || null, bookedBy: def.bookedBy || null, phone: def.phone || null, paid: !!def.paid,
+    activatedAt: preserveState ? (previousSlot.activatedAt || null) : (autoActivate ? now : null),
+    activatedBy: preserveState ? (previousSlot.activatedBy || null) : (autoActivate ? 'auto' : null),
+    attempts: preserveState ? Number(previousSlot.attempts || 0) : 0,
+    lockedUntil: preserveState ? (previousSlot.lockedUntil || null) : null,
+    expired: preserveState ? !!previousSlot.expired : false,
+    deleted: false,
+    slotTs: preserveState && typeof previousSlot.slotTs === 'number' ? previousSlot.slotTs : now,
+    version: preserveState ? Number(previousSlot.version || 0) : Number(previousSlot && previousSlot.version || 0),
+    _fresh: !preserveState,
     date: dateStr
   };
 }
-
 function rolloverRoomLocally(r) {
   harvestRecurringDefs(r); // one-time lift of legacy bucket recurring slots into defs
   const todaySlots    = normalizeSlots(r.slots[0]);
@@ -4420,7 +4433,7 @@ function isScheduledNow(room) {
   // A recurring slot only counts today if today's weekday is in its days list
   // (recurringRunsToday); one-time slots and legacy recurring slots (no days)
   // count as before.
-  return (room.slots[0]||[]).some(s => !s.deleted &&
+  return (room.slots[0]||[]).some(s => !s.deleted && !!s.activatedAt &&
     nm >= toMins(s.s) && nm < toMins(s.e) && (!s.recurring || recurringRunsToday(s)));
 }
 
@@ -4905,7 +4918,7 @@ function renderDashboard() {
     state.rooms.forEach(r => {
       if (getLightState(r).on) onCount++;
       if (r.override !== null) manualCount++;
-      slotCount += (r.slots[0]||[]).length;
+      slotCount += visibleSlots(r.slots[0]).length;
     });
     document.getElementById('s-on').textContent = onCount;
     document.getElementById('s-manual').textContent = manualCount;
