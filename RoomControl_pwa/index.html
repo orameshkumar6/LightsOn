@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- RoomController v2.4 - slot-count + activation-isolation fixes 2026-09-27 -->
+<!-- RoomController v2.4 - slot timestamp consistency fix 2026-09-28 -->
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -3629,8 +3629,12 @@ async function publishSlotSyncV2(roomId, bucket, slot, operation, profile) {
   const revision = Number(meta.revision || 1) + 1;
   const now = Date.now();
   const canonicalBucket = syncV2Bucket(bucket);
+  // Preserve the optimistic-lock timestamp established by the actual /rooms
+  // slot mutation. Creating a second slotTs here made the same PWA appear to
+  // be a conflicting device immediately after creating a slot.
+  const mutationSlotTs = typeof slot.slotTs === 'number' ? slot.slotTs : now;
   const canonical = { ...slot, id:slot.id, version:Number(slot.version || 0) + 1,
-    slotTs:now, updatedAt:now, deleted:!!slot.deleted };
+    slotTs:mutationSlotTs, updatedAt:now, deleted:!!slot.deleted };
   delete canonical._fresh;
   const patch = {};
   patch[`slotRecords/room${roomId}/${canonicalBucket}/${slot.id}`] = canonical;
