@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- RoomController v2.4.1 - override isolation fix 2026-09-29 -->
+<!-- RoomController v2.5 - Sync V2 cache-first refresh optimization 2026-09-30 -->
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -382,7 +382,6 @@
       <div id="headerProfileArea"></div>
     </div>
     <div class="header-right">
-      <button class="sync-btn" id="syncBtn" onclick="manualSyncFromFirebase()" title="Upload any unsaved local changes, then pull the latest data for this profile from Firebase"><span class="sync-ico" id="syncIco">↻</span> <span id="syncLabel">Sync</span></button>
       <div class="live-dot" id="liveDot"></div>
       <span class="conn-label" id="connLabel">Connecting…</span>
       <span class="clock" id="headerClock"></span>
@@ -434,6 +433,9 @@
   <!-- Settings -->
   <div class="page" id="page-settings">
     <div class="fb-badge">🔥 Firebase Realtime Database</div>
+    <button class="sync-btn" id="syncBtn" onclick="manualSyncFromFirebase()" title="Force authoritative synchronization with Firebase" style="width:100%;margin-bottom:12px">
+      <span class="sync-ico" id="syncIco">↻</span> <span id="syncLabel">Sync</span>
+    </button>
     <!-- Admin mode toggle — per-device (localStorage). When off, advanced
          setup sections are hidden, leaving only beep settings, today's admin
          code, and About. Always visible (admin-exempt). -->
@@ -3106,47 +3108,223 @@ async function fbGet(path, profile) {
   }
 }
 
+// ── PWA Sync V2 consumer — cache-first startup ───────────────
+// The locally persisted room snapshot is rendered immediately. Startup reads
+// only /sync/meta; unchanged revision means no room/slot collection download.
+// Missing revisions, generation changes, invalid deltas, or an absent local
+// cursor fall back to one authoritative /rooms refresh.
+let pwaSyncInFlight = false;
+let pwaControlPoll = null;
+
+function applyRemoteRoomSnapshot(roomId, remote) {
+  if (!remote || typeof remote !== 'object') return false;
+  let room = state.rooms.find(r => r.id === roomId);
+  if (!room) {
+    room = { id:roomId, name:`Room ${roomId}`, override:null, relayPin:null, ledPin:null,
+      expanded:false, panelTab:'slot', slots:{0:[],1:[]},
+      recurring:{days:[],start:'09:00',end:'10:00'}, recurringDefs:[] };
+    state.rooms.push(room);
+    state.rooms.sort((a,b) => a.id-b.id);
+  }
+  if (typeof remote.name === 'string' && remote.name.trim()) room.name = remote.name;
+  if (remote.relayPin === null || typeof remote.relayPin === 'number') room.relayPin = remote.relayPin;
+  if (remote.ledPin === null || typeof remote.ledPin === 'number') room.ledPin = remote.ledPin;
+  if (remote.lightOn !== undefined) room.lightOn = remote.lightOn;
+  reconcileOverride(room, remote);
+  room.slots = room.slots || {0:[],1:[]};
+  room.slots[0] = ensureSlotIds(normalizeSlots(remote.slots));
+  room.slots[1] = ensureSlotIds(normalizeSlots(remote.slotsT));
+  room.recurringDefs = normalizeSlots(remote.recurring);
+  room._syncedSlotIds = room.slots[0].map(sl => sl && sl.id).filter(Boolean);
+  room._syncedRecurDefIds = room.recurringDefs.map(d => d && d.id).filter(Boolean);
+  return true;
+}
+
+async function pwaFullRoomsRefresh(p, meta, reason) {
+  const data = await fbGet('/rooms', p);
+  if (!data || typeof data !== 'object') return false;
+  const seen = new Set();
+  Object.keys(data).forEach(key => {
+    const m = key.match(/^room(\d+)$/);
+    if (!m) return;
+    const roomId = parseInt(m[1], 10);
+    if (applyRemoteRoomSnapshot(roomId, data[key] || {})) seen.add(roomId);
+  });
+  // Remove only rooms that were previously synced but no longer exist remotely.
+  // A completely empty database does not reach this branch because data must be an object.
+  state.rooms = state.rooms.filter(r => seen.has(r.id));
+  if (!state.rooms.length) state.rooms = makeBlankRooms();
+  if (meta) {
+    p.pwaSyncGeneration = Number(meta.generation || 0);
+    p.pwaSyncRevision = Number(meta.revision || 0);
+  }
+  persist();
+  renderDashboard();
+  refreshTimelineIfVisible();
+  addLog('ok', `Sync V2 full refresh (${reason || 'recovery'})`);
+  return true;
+}
+
+async function applyPwaSyncV2Change(revision, change, p) {
+  if (!change || typeof change !== 'object') return false;
+  if (change.type === 'FULL_SYNC') return 'full';
+  const roomId = Number(change.roomId);
+  if (!roomId || !change.entity) return false;
+  const room = state.rooms.find(r => r.id === roomId);
+
+  if (change.entity === 'slot') {
+    if (!room || !change.recordId) return false;
+    const bucket = change.bucket === 'tomorrow' ? 1 : 0;
+    const canonical = await fbGet(`/slotRecords/room${roomId}/${change.bucket === 'tomorrow' ? 'tomorrow' : 'today'}/${change.recordId}`, p);
+    if (!canonical || typeof canonical !== 'object') return false;
+    room.slots = room.slots || {0:[],1:[]};
+    const list = normalizeSlots(room.slots[bucket]);
+    const idx = list.findIndex(sl => sl && sl.id === change.recordId);
+    if (canonical.deleted || change.operation === 'delete') {
+      if (idx >= 0) list[idx] = { ...canonical, deleted:true };
+      else list.push({ ...canonical, deleted:true });
+    } else if (idx >= 0) list[idx] = canonical;
+    else list.push(canonical);
+    room.slots[bucket] = ensureSlotIds(list);
+    room._syncedSlotIds = room.slots[0].map(sl => sl && sl.id).filter(Boolean);
+    return true;
+  }
+
+  if (change.entity === 'recurringDef') {
+    if (!room || !change.recordId) return false;
+    const canonical = await fbGet(`/recurringDefs/room${roomId}/${change.recordId}`, p);
+    if (!canonical || typeof canonical !== 'object') return false;
+    const defs = Array.isArray(room.recurringDefs) ? room.recurringDefs : [];
+    const idx = defs.findIndex(d => d && d.id === change.recordId);
+    if (canonical.deleted || change.operation === 'delete') {
+      if (idx >= 0) defs.splice(idx, 1);
+    } else if (idx >= 0) defs[idx] = canonical;
+    else defs.push(canonical);
+    room.recurringDefs = defs;
+    room._syncedRecurDefIds = defs.map(d => d && d.id).filter(Boolean);
+    return true;
+  }
+
+  if (change.entity === 'roomSnapshot') {
+    const remote = await fbGet(`/rooms/room${roomId}`, p);
+    return applyRemoteRoomSnapshot(roomId, remote);
+  }
+  return false;
+}
+
+async function pwaSyncFromMeta(meta, p) {
+  if (pwaSyncInFlight || !meta || typeof meta !== 'object') return;
+  pwaSyncInFlight = true;
+  try {
+    const remoteGeneration = Number(meta.generation || 0);
+    const remoteRevision = Number(meta.revision || 0);
+    const localGeneration = Number(p.pwaSyncGeneration || 0);
+    const localRevision = Number(p.pwaSyncRevision || 0);
+    const cacheValid = Array.isArray(state.rooms) && state.rooms.length > 0 &&
+      localGeneration > 0 && localRevision > 0;
+
+    if (!cacheValid || localGeneration !== remoteGeneration || localRevision > remoteRevision) {
+      await pwaFullRoomsRefresh(p, meta, !cacheValid ? 'bootstrap' : 'generation change');
+      return;
+    }
+    if (localRevision === remoteRevision) {
+      setConnStatus(true);
+      return;
+    }
+
+    for (let revision = localRevision + 1; revision <= remoteRevision; revision++) {
+      const change = await fbGet(`/sync/changes/${revision}`, p);
+      if (!change) {
+        await pwaFullRoomsRefresh(p, meta, `missing revision ${revision}`);
+        return;
+      }
+      const applied = await applyPwaSyncV2Change(revision, change, p);
+      if (applied === 'full' || applied !== true) {
+        await pwaFullRoomsRefresh(p, meta,
+          applied === 'full' ? `FULL_SYNC revision ${revision}` : `invalid revision ${revision}`);
+        return;
+      }
+      p.pwaSyncGeneration = remoteGeneration;
+      p.pwaSyncRevision = revision;
+    }
+    persist();
+    renderDashboard();
+    refreshTimelineIfVisible();
+    setConnStatus(true);
+    addLog('ok', `Sync V2 incremental → revision ${remoteRevision}`);
+  } finally {
+    pwaSyncInFlight = false;
+  }
+}
+
+async function startPwaSyncV2() {
+  const p = getActiveProfile();
+  if (!p || !p.dbUrl) return;
+  const meta = await fbGet('/sync/meta', p);
+  if (!meta || typeof meta !== 'object') {
+    // Pre-Sync-V2 or incomplete database: one compatibility bootstrap.
+    await pwaFullRoomsRefresh(p, null, 'Sync V2 metadata unavailable');
+    return;
+  }
+  await pwaSyncFromMeta(meta, p);
+}
+
+// Lightweight live listener: /sync/meta is tiny and does not stream /rooms.
+// Slot bodies are fetched only for revisions that changed.
 // ── Firebase SSE listener (real-time) ───────────────────────
 function startFbListener() {
   const p = getActiveProfile();
   if (!p.dbUrl) return;
   if (fbListener) { fbListener.close(); fbListener = null; }
-  // Firebase SSE requires Accept: text/event-stream header
-  // EventSource sends this automatically but some browsers need the explicit param
-  const url = `${p.dbUrl}${profilePathPrefix(p)}/rooms.json`;
+  const url = `${p.dbUrl}${profilePathPrefix(p)}/sync/meta.json`;
   let es;
-  try {
-    es = new EventSource(url);
-  } catch(e) {
-    startPolling();
-    return;
-  }
+  try { es = new EventSource(url); }
+  catch(e) { startPolling(); return; }
   fbListener = es;
-
-  es.addEventListener('put', e => {
+  const onMetaEvent = e => {
     try {
       const d = JSON.parse(e.data);
-      applyFirebasePathUpdate(d.path, d.data);
+      // Listener root is /sync/meta; a root put carries the complete meta object.
+      // A field patch is cheapest to resolve by one small /sync/meta GET.
+      if (d.path === '/' && d.data && typeof d.data === 'object') {
+        pwaSyncFromMeta(d.data, p);
+      } else {
+        fbGet('/sync/meta', p).then(meta => pwaSyncFromMeta(meta, p));
+      }
       setConnStatus(true);
-    } catch(err) {}
-  });
-
-  es.addEventListener('patch', e => {
-    try {
-      const d = JSON.parse(e.data);
-      applyFirebasePathUpdate(d.path, d.data);
-    } catch(err) {}
-  });
-
-  es.onerror = (err) => {
+    } catch(err) { setConnStatus(false); }
+  };
+  es.addEventListener('put', onMetaEvent);
+  es.addEventListener('patch', onMetaEvent);
+  es.onerror = () => {
     setConnStatus(false);
-    // If SSE fails repeatedly, switch to polling
-    if (fbListener) {
-      fbListener.close();
-      fbListener = null;
-    }
+    if (fbListener) { fbListener.close(); fbListener = null; }
     startPolling();
   };
+  startControlPolling();
+}
+
+// Overrides and ESP light state are not slot Sync V2 entities. Poll only those
+// scalar fields; never download /rooms or slot arrays in this routine.
+async function pollRoomControlsOnce() {
+  const p = getActiveProfile();
+  if (!p || !p.dbUrl) return;
+  for (const room of state.rooms) {
+    const remoteAt = await fbGet(`/rooms/room${room.id}/overrideAt`, p);
+    if (typeof remoteAt === 'number' && remoteAt !== Number(room.overrideAt || 0)) {
+      const remoteOverride = await fbGet(`/rooms/room${room.id}/override`, p);
+      reconcileOverride(room, { override:remoteOverride, overrideAt:remoteAt });
+    }
+    const lightOn = await fbGet(`/rooms/room${room.id}/lightOn`, p);
+    if (lightOn === true || lightOn === false) room.lightOn = lightOn;
+  }
+  persist();
+  renderDashboard();
+}
+function startControlPolling() {
+  if (pwaControlPoll) clearInterval(pwaControlPoll);
+  pollRoomControlsOnce();
+  pwaControlPoll = setInterval(pollRoomControlsOnce, 10000);
 }
 
 // Track when PWA last wrote override to prevent immediate sync overwrite
@@ -3549,20 +3727,17 @@ async function manualSyncFromFirebase(opts) {
 // ── Polling fallback when SSE fails ──────────────────────────
 let pollingInterval = null;
 function startPolling() {
-  if (pollingInterval) return; // already polling
+  if (pollingInterval) return;
+  const p = getActiveProfile();
   pollingInterval = setInterval(async () => {
-    if (!getActiveProfile().dbUrl) return;
-
-    try {
-      const data = await fbGet('/rooms');
-      if (data) {
-        syncFromFirebase(data);
-        setConnStatus(true); // polling is working — without this the "Offline"
-                              // label set when SSE first dropped never clears,
-                              // even though data keeps arriving fine via polling
-      }
-    } catch(e) { setConnStatus(false); }
-  }, 50000000);
+    if (!p.dbUrl) return;
+    const meta = await fbGet('/sync/meta', p);
+    if (meta) {
+      await pwaSyncFromMeta(meta, p);
+      setConnStatus(true);
+    }
+  }, 10000);
+  startControlPolling();
 }
 
 // ── Write full room state to Firebase ───────────────────────
@@ -5464,7 +5639,8 @@ async function switchProfile(id) {
     await ensureProfileNumber(p); // must resolve before the listener opens, so it reads the right /profiles/{n} path
     persist();
     startFbListener();
-    checkDailySlotRefresh(p); // this profile's own slots — see function comment
+    await startPwaSyncV2();
+    checkDailySlotRefresh(p); // full read only when rollover marker changed
     refreshControllerStatus(); // board health for the newly-active profile
   }
 }
@@ -5510,6 +5686,7 @@ function deleteProfile(id) {
 function resetConnectionForProfileChange() {
   if (fbListener) { fbListener.close(); fbListener = null; }
   if (pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; }
+  if (pwaControlPoll) { clearInterval(pwaControlPoll); pwaControlPoll = null; }
   setConnStatus(false);
   qrGenerated = false;
   document.getElementById('qrHidden').style.display = 'none';
@@ -6211,10 +6388,8 @@ function bootApp() {
 
   if (getActiveProfile().dbUrl) {
     startFbListener();
-    checkDailySlotRefresh(getActiveProfile()); // once per profile per day — see function comment
-    manualSyncFromFirebase({ silent: true }); // on load: push any uncommitted (dirty) rooms,
-      // then pull all Firebase data for the active profile. Stale (non-dirty) rooms are
-      // never re-uploaded, so deletions made on another device stick on refresh.
+    startPwaSyncV2(); // cache-first: /sync/meta, then only missing deltas/canonical records
+    checkDailySlotRefresh(getActiveProfile()); // full /rooms only when rollover marker changed
     refreshControllerStatus(); // initial board-health read
   }
   renderDashboard();
