@@ -3785,112 +3785,159 @@ function syncV2GenerationToday() {
   return Number(String(d.getFullYear()) + String(d.getMonth()+1).padStart(2,'0') + String(d.getDate()).padStart(2,'0'));
 }
 function syncV2Bucket(bucket) { return bucket === 'slotsT' || bucket === 1 ? 'tomorrow' : 'today'; }
+async function appendSyncV2ChangeAtomic(profile, reason, buildChange) {
+  const p = profile || getActiveProfile();
+  const generation = syncV2GenerationToday();
+  const maxAttempts = 8;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const readRes = await fetch(fbUrl('/sync', p) + '?nc=' + Date.now() + '_' + attempt, {
+        method:'GET', cache:'no-store',
+        headers:{ 'Accept':'application/json', 'X-Firebase-ETag':'true' }
+      });
+      if (!readRes.ok) throw new Error(await readRes.text());
+      const etag = readRes.headers.get('ETag');
+      if (!etag) throw new Error('Firebase did not return an ETag for /sync');
+      const sync = (await readRes.json()) || {};
+      const oldMeta = sync.meta || {};
+      const generationChanged = Number(oldMeta.generation) !== generation;
+      const now = Date.now();
+      const revision = generationChanged ? 2 : Number(oldMeta.revision || 1) + 1;
+      const patch = {};
+      if (generationChanged) {
+        patch.meta = { schemaVersion:2, generation, revision, resetAt:now,
+          resetReason:reason || 'pwa', updatedAt:now };
+        patch.changes = {
+          '1': { type:'FULL_SYNC', reason:reason || 'pwa', generation, updatedAt:now },
+          [String(revision)]: buildChange(revision, generation, now)
+        };
+      } else {
+        patch[`changes/${revision}`] = buildChange(revision, generation, now);
+        patch['meta/revision'] = revision;
+        patch['meta/updatedAt'] = now;
+      }
+      const writeRes = await fetch(fbUrl('/sync', p), {
+        method:'PATCH',
+        headers:{ 'Content-Type':'application/json', 'Accept':'application/json', 'If-Match':etag },
+        body:JSON.stringify(patch)
+      });
+      if (writeRes.status === 412) {
+        await new Promise(resolve => setTimeout(resolve, 35 + Math.floor(Math.random()*90)));
+        continue;
+      }
+      if (!writeRes.ok) throw new Error(await writeRes.text());
+      return { revision, generation, updatedAt:now };
+    } catch(e) {
+      if (attempt === maxAttempts - 1) {
+        addLog('error', 'Sync V2 atomic revision failed: ' + e.message);
+        setConnStatus(false);
+        return null;
+      }
+      await new Promise(resolve => setTimeout(resolve, 60 + Math.floor(Math.random()*140)));
+    }
+  }
+  return null;
+}
+
 async function syncV2Meta(profile, reason) {
   const p = profile || getActiveProfile();
   const generation = syncV2GenerationToday();
-  let meta = await fbGet('/sync/meta', p);
-  if (!meta || Number(meta.generation) !== generation) {
-    meta = { schemaVersion:2, generation, revision:1, resetAt:Date.now(), resetReason:reason || 'pwa' };
-    const ok = await fbPatch('/', {
-      'sync/meta': meta,
-      'sync/changes': { '1': { type:'FULL_SYNC', reason:reason || 'pwa', generation, updatedAt:Date.now() } }
-    }, p);
-    if (!ok) return null;
-  }
-  return meta;
+  const current = await fbGet('/sync/meta', p);
+  if (current && Number(current.generation) === generation) return current;
+  const reset = await resetDailySyncV2(p, reason || 'pwa');
+  return reset ? await fbGet('/sync/meta', p) : null;
 }
+
 async function publishSlotSyncV2(roomId, bucket, slot, operation, profile) {
   const p = profile || getActiveProfile();
-  const meta = await syncV2Meta(p, 'slot_mutation');
-  if (!meta || !slot || !slot.id) return false;
-  const revision = Number(meta.revision || 1) + 1;
+  if (!slot || !slot.id) return false;
   const now = Date.now();
   const canonicalBucket = syncV2Bucket(bucket);
-  // Preserve the optimistic-lock timestamp established by the actual /rooms
-  // slot mutation. Creating a second slotTs here made the same PWA appear to
-  // be a conflicting device immediately after creating a slot.
   const mutationSlotTs = typeof slot.slotTs === 'number' ? slot.slotTs : now;
-  const canonical = { ...slot, id:slot.id, version:Number(slot.version || 0) + 1,
+  const canonical = { ...slot, id:slot.id, version:Number(slot.version || 0)+1,
     slotTs:mutationSlotTs, updatedAt:now, deleted:!!slot.deleted };
   delete canonical._fresh;
-  const patch = {};
-  patch[`slotRecords/room${roomId}/${canonicalBucket}/${slot.id}`] = canonical;
-  patch[`sync/changes/${revision}`] = {
-    entity:'slot', operation:operation || (canonical.deleted ? 'delete':'update'),
+  const canonicalOk = await fbSet(`/slotRecords/room${roomId}/${canonicalBucket}/${slot.id}`, canonical, p);
+  if (!canonicalOk) return false;
+  const committed = await appendSyncV2ChangeAtomic(p, 'slot_mutation', (revision,generation,changedAt) => ({
+    entity:'slot', operation:operation || (canonical.deleted?'delete':'update'),
     roomId, bucket:canonicalBucket, recordId:slot.id, version:canonical.version,
-    revision, generation:meta.generation, updatedAt:now
-  };
-  patch['sync/meta/revision'] = revision;
-  patch['sync/meta/updatedAt'] = now;
-  return await fbPatch('/', patch, p) ? canonical : false;
+    revision, generation, updatedAt:changedAt
+  }));
+  return committed ? canonical : false;
 }
+
 async function publishRecurringDefSyncV2(roomId, def, operation, profile) {
   const p = profile || getActiveProfile();
   if (!def || !def.id) return false;
-  const meta = await syncV2Meta(p, 'recurring_definition');
-  if (!meta) return false;
-  const revision = Number(meta.revision || 1) + 1;
   const now = Date.now();
-  const version = Number(def.version || 0) + 1;
-  const patch = {};
-  if (operation === 'delete') {
-    // Keep a tombstone so an offline PWA can learn the definition was deleted.
-    patch[`recurringDefs/room${roomId}/${def.id}`] = {
-      id:def.id, deleted:true, version, defTs:now, updatedAt:now
-    };
-  } else {
-    patch[`recurringDefs/room${roomId}/${def.id}`] = {
-      ...def, id:def.id, deleted:false, version, defTs:now, updatedAt:now
-    };
-  }
-  patch[`sync/changes/${revision}`] = {
-    entity:'recurringDef', operation, roomId, recordId:def.id,
-    version, revision, generation:meta.generation, updatedAt:now
-  };
-  patch['sync/meta/revision'] = revision;
-  patch['sync/meta/updatedAt'] = now;
-  const ok = await fbPatch('/', patch, p);
-  return ok ? { ...def, version, defTs:now, updatedAt:now, deleted:operation === 'delete' } : false;
+  const version = Number(def.version || 0)+1;
+  const canonical = operation === 'delete'
+    ? { id:def.id, deleted:true, version, defTs:now, updatedAt:now }
+    : { ...def, id:def.id, deleted:false, version, defTs:now, updatedAt:now };
+  if (!await fbSet(`/recurringDefs/room${roomId}/${def.id}`, canonical, p)) return false;
+  const committed = await appendSyncV2ChangeAtomic(p, 'recurring_definition', (revision,generation,changedAt) => ({
+    entity:'recurringDef', operation, roomId, recordId:def.id, version,
+    revision, generation, updatedAt:changedAt
+  }));
+  return committed ? canonical : false;
 }
 
 async function publishRoomSnapshotSyncV2(room, profile, reason) {
   if (!room || !room.id) return false;
   const p = profile || getActiveProfile();
-  const meta = await syncV2Meta(p, reason || 'room_snapshot');
-  if (!meta) return false;
-  const revision = Number(meta.revision || 1) + 1;
   const now = Date.now();
-  const patch = {};
-  patch[`roomIndex/room${room.id}`] = {
+  if (!await fbSet(`/roomIndex/room${room.id}`, {
     id:room.id, name:room.name || `Room ${room.id}`,
     relayPin:room.relayPin ?? null, ledPin:room.ledPin ?? null, updatedAt:now
-  };
-
-  // IMPORTANT: a room snapshot is metadata/refresh notification only.
-  // Do NOT republish cached slot bodies here. Slot bodies contain activation
-  // authority (activatedAt/activatedBy/attempts/lockedUntil) and writing an
-  // older local copy can overwrite a newer targeted activate/deactivate write.
-  // Slot mutations are published only through publishSlotSyncV2().
-  // Recurring definitions are published only through publishRecurringDefSyncV2().
-
-  patch[`sync/changes/${revision}`] = {
+  }, p)) return false;
+  const committed = await appendSyncV2ChangeAtomic(p, reason || 'room_snapshot', (revision,generation,changedAt) => ({
     entity:'roomSnapshot', operation:'refresh', roomId:room.id,
     recordId:`room${room.id}`, reason:reason || 'room_snapshot',
-    revision, generation:meta.generation, updatedAt:now
-  };
-  patch['sync/meta/revision'] = revision;
-  patch['sync/meta/updatedAt'] = now;
-  return fbPatch('/', patch, p);
+    revision, generation, updatedAt:changedAt
+  }));
+  return !!committed;
 }
+
 async function resetDailySyncV2(profile, reason) {
   const p = profile || getActiveProfile();
   const generation = syncV2GenerationToday();
-  const now = Date.now();
-  return fbPatch('/', {
-    'sync/meta': { schemaVersion:2, generation, revision:1, resetAt:now, resetReason:reason || 'midnight_rollover' },
-    'sync/changes': { '1': { type:'FULL_SYNC', reason:reason || 'midnight_rollover', generation, updatedAt:now } }
-  }, p);
+  const maxAttempts = 8;
+  for (let attempt=0; attempt<maxAttempts; attempt++) {
+    try {
+      const readRes = await fetch(fbUrl('/sync',p) + '?nc=' + Date.now() + '_' + attempt, {
+        method:'GET', cache:'no-store', headers:{'Accept':'application/json','X-Firebase-ETag':'true'}
+      });
+      if (!readRes.ok) throw new Error(await readRes.text());
+      const etag = readRes.headers.get('ETag');
+      if (!etag) throw new Error('Firebase did not return an ETag for /sync reset');
+      const now=Date.now();
+      const replacement={
+        meta:{schemaVersion:2,generation,revision:1,resetAt:now,resetReason:reason||'midnight_rollover',updatedAt:now},
+        changes:{'1':{type:'FULL_SYNC',reason:reason||'midnight_rollover',generation,updatedAt:now}}
+      };
+      const writeRes=await fetch(fbUrl('/sync',p),{
+        method:'PUT',headers:{'Content-Type':'application/json','Accept':'application/json','If-Match':etag},
+        body:JSON.stringify(replacement)
+      });
+      if (writeRes.status===412) {
+        await new Promise(resolve=>setTimeout(resolve,35+Math.floor(Math.random()*90)));
+        continue;
+      }
+      if (!writeRes.ok) throw new Error(await writeRes.text());
+      return true;
+    } catch(e) {
+      if (attempt===maxAttempts-1) {
+        addLog('error','Sync V2 atomic reset failed: '+e.message);
+        setConnStatus(false);
+        return false;
+      }
+      await new Promise(resolve=>setTimeout(resolve,60+Math.floor(Math.random()*140)));
+    }
+  }
+  return false;
 }
+
 async function bumpConfigSyncV2(profile, changedKeys) {
   const p = profile || getActiveProfile();
   const current = await fbGet('/configSync/version', p);
