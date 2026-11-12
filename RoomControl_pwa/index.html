@@ -2172,8 +2172,24 @@ async function saveSlotFromModal() {
     const freshSlot = (r.slots[savedDay] || []).find(sl => sl && sl.id === newSlot.id);
     if (freshSlot) {
       const bucketName = savedDay === 0 ? 'slots' : 'slotsT';
-      try { await publishSlotSyncV2(savedRoomId, bucketName, freshSlot, 'create', getActiveProfile()); }
+      const profileNow = getActiveProfile();
+      let canonical = false;
+      try { canonical = await publishSlotSyncV2(savedRoomId, bucketName, freshSlot, 'create', profileNow); }
       catch(e) { addLog('error', 'canonical publish for auto-active slot failed: ' + e.message); }
+      if (canonical) {
+        // Same end state as the Activate button: /rooms and the local slot carry the
+        // canonical's version too. A failure here is non-fatal (/rooms still has the
+        // activation and the board falls back to it), so just log it.
+        freshSlot.version = canonical.version;
+        persist();
+        try {
+          if (!await mirrorCanonicalVersionToRooms(savedRoomId, bucketName, canonical, profileNow))
+            addLog('error', `room${savedRoomId} slot ${newSlot.id}: version mirror to /rooms failed`);
+        } catch(e) { addLog('error', 'version mirror for auto-active slot failed: ' + e.message); }
+      } else {
+        addLog('error', `room${savedRoomId} slot ${newSlot.id}: canonical publish for auto-active slot failed — board will read it from /rooms`);
+        showToast('⚠️ Slot saved, but live sync to the controller is delayed — check the connection');
+      }
     }
   }
   renderDashboard();
@@ -4973,6 +4989,22 @@ async function publishSlotSyncV2(roomId, bucket, slot, operation, profile) {
   return committed ? canonical : false;
 }
 
+// Copy a just-published canonical's `version` onto the matching /rooms slot (key
+// resolved fresh by id, never a captured index). updateSlotById() mirrors the whole
+// canonical to /rooms; callers that publish a canonical AFTER pushRoom() already
+// wrote the slot (auto-activated create) use this so /rooms carries the same
+// version, instead of leaving it unversioned while /slotRecords says 1.
+async function mirrorCanonicalVersionToRooms(roomId, bucket, canonical, profile) {
+  const p = profile || getActiveProfile();
+  if (!canonical || !canonical.id || !Number.isFinite(Number(canonical.version))) return false;
+  const raw = await fbGet(`/rooms/room${roomId}/${bucket}`, p);
+  if (raw === null || raw === undefined) return false;
+  const entries = Array.isArray(raw) ? raw.map((slot, index) => [String(index), slot]) : Object.entries(raw);
+  const match = entries.find(([key, slot]) => slot && slot.id === canonical.id);
+  if (!match) return false;
+  return fbPatch(`/rooms/room${roomId}/${bucket}/${match[0]}`, { version: canonical.version }, p);
+}
+
 async function publishRecurringDefSyncV2(roomId, def, operation, profile) {
   const p = profile || getActiveProfile();
   if (!def || !def.id) return false;
@@ -5806,9 +5838,19 @@ function rolloverRoomLocally(r) {
   const keptOneTimeToday = todaySlots.filter(sl => !sl.recurring && !sl.deleted && sl.date === todayDateStr);
   // 3. Promote only NON-recurring, non-deleted slots from tomorrow (reset
   //    activation, date→today). A tombstoned tomorrow slot is purged here too.
+  //    A no-code ("Auto") slot is active by default, so it is promoted ACTIVE
+  //    (activatedAt = now, activatedBy 'auto') — same as the ESP32's own rollover
+  //    and as the create path. pushRoom() keeps a null activatedAt on a _fresh
+  //    no-code slot (it reads that as "admin deactivated it"), so leaving it null
+  //    here promoted every no-code slot INACTIVE. Coded slots still reset to null.
+  const promotedAt = Date.now();
   const promoted = tomorrowSlots
     .filter(sl => !sl.recurring && !sl.deleted)
-    .map(sl => ({ ...sl, ...resetFields, date: todayDateStr }));
+    .map(sl => {
+      const p = { ...sl, ...resetFields, date: todayDateStr };
+      if (!sl.code) { p.activatedAt = promotedAt; p.activatedBy = 'auto'; }
+      return p;
+    });
 
   r.slots[0] = [...regenToday, ...keptOneTimeToday, ...promoted];
 
