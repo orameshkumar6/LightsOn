@@ -6,6 +6,19 @@
  *             LittleFS (bundled with modern ESP32 board packages),
  *             WiFi, HTTPClient, WiFiClientSecure (all built-in)
  *
+ *  v6.13 — Rollover: id/content-based carry-over, activation not lost mid-day;
+ *  no-code slots stamped like the PWA (epoch-ms activatedAt + activatedBy auto,
+ *  not a bare 1) and a stale-canonical (lower version) delta can no longer
+ *  switch an active slot off:
+ *  - One-time slots dated today are copied from the already-read today bucket
+ *    instead of fetching /slots/<RAM index> (the RAM array is compacted/sorted, so
+ *    the index is not the Firebase key and the wrong slot / none was fetched).
+ *  - A failed read of a room's today bucket skips that room and marks the run
+ *    incomplete (retried) instead of rebuilding it from nothing.
+ *  - Recurring activations are also taken from the canonical /slotRecords today
+ *    bucket (date = today), so a mid-day rollover no longer resets an activation
+ *    the PWA already shows as Active.
+ *
  *  v6.12 — Emergency light decoupled from rollover / reboot / self-heal give-up:
  *  - midnightRollover() snapshots each room's lightOn and the emergency timer/latch
  *    around its applyAllStates(). If no room actually changed state, the timer and
@@ -985,6 +998,17 @@ bool applyCanonicalSlotDelta(const String &roomId, const String &bucket,
       rooms[ri].slotCount--;
     } else {
       Slot &cur = rooms[ri].slots[existing];
+      // Stale-record guard: every PWA publish bumps `version`, and we copy it into
+      // cur.version below. A canonical record OLDER than what we already hold (e.g.
+      // an activation-less record left behind for an auto-active no-code slot) must
+      // never override the newer state — that is what switched such slots off while
+      // the PWA still showed Active. Equal/newer (or unversioned) records apply.
+      long rawVersion = extractRawField(raw, "version").toInt();
+      if (rawVersion > 0 && cur.version > 0 && rawVersion < cur.version) {
+        Serial.printf("Sync V2: ignoring stale canonical room=%d id=%s (v%ld < local v%ld)\n",
+          ri + 1, recordId.c_str(), rawVersion, cur.version);
+        return true;
+      }
       cur.activated = raw.indexOf("\"activatedAt\":") >= 0 && raw.indexOf("\"activatedAt\":null") < 0;
       cur.expired = raw.indexOf("\"expired\":true") >= 0;
       extractRawField(raw, "slotTs").toCharArray(cur.slotTs, sizeof(cur.slotTs));
@@ -1909,6 +1933,14 @@ String daysFieldFromMask(int daysMask) {
   return out;
 }
 
+// Current wall-clock time as epoch MILLISECONDS (same unit as the PWA's Date.now()).
+// Used to stamp activatedAt on auto-activated (no-code) slots instead of a bare 1.
+String nowEpochMsStr() {
+  char b[24];
+  snprintf(b, sizeof(b), "%llu", (unsigned long long)time(nullptr) * 1000ULL);
+  return String(b);
+}
+
 // Parses a "days":[..] array out of a raw slot JSON object into a mask.
 int daysMaskFromJson(const String &slotObj) {
   int mask = 0;
@@ -1961,7 +1993,7 @@ void appendRecurringFromJson(const String &slotsJson, int targetWd, const String
           if (ph.length() > 0) phoneField = ",\"phone\":\"" + ph + "\"";
           if (!first) out += ",";
           // No-code slot → seed activatedAt (auto-active); coded → null.
-          String activatedField = hasCode ? ",\"activatedAt\":null" : ",\"activatedAt\":1";
+          String activatedField = hasCode ? ",\"activatedAt\":null" : ",\"activatedAt\":" + nowEpochMsStr() + ",\"activatedBy\":\"auto\"";
           out += "{\"s\":\"" + sStr + "\",\"e\":\"" + eStr + "\",\"recurring\":true" +
             codeField + bookedByField + phoneField + daysFieldFromMask(mask) +
             ",\"date\":\"" + dateStr + "\"" + activatedField + "}";
@@ -1993,7 +2025,7 @@ String buildRecurringSlotJson(int roomIdx, int j, const String &base, const Stri
   String daysField = daysFieldFromMask(rooms[roomIdx].slots[j].daysMask);
   // No-code slot → seed activatedAt (auto-active); coded slot → null (waits for
   // activation). See buildDefSlotJson for the rationale.
-  String activatedField = hasCode ? ",\"activatedAt\":null" : ",\"activatedAt\":1";
+  String activatedField = hasCode ? ",\"activatedAt\":null" : ",\"activatedAt\":" + nowEpochMsStr() + ",\"activatedBy\":\"auto\"";
   return "{\"s\":\"" + String(s) + "\",\"e\":\"" + String(e) + "\",\"recurring\":true" +
     codeField + bookedByField + phoneField + daysField + ",\"date\":\"" + dateStr + "\"" + activatedField + "}";
 }
@@ -2037,7 +2069,7 @@ String buildDefSlotJson(int roomIdx, int k, const String &dateStr,
     // activatedAt, no longer force-activating on code:null). Coded slots reset to
     // null so they wait for the QR PIN / admin Activate. Sentinel 1 = "activated,
     // exact time unknown" — parseSlots only checks non-null.
-    activatedField = hasCode ? ",\"activatedAt\":null" : ",\"activatedAt\":1";
+    activatedField = hasCode ? ",\"activatedAt\":null" : ",\"activatedAt\":" + nowEpochMsStr() + ",\"activatedBy\":\"auto\"";
   }
   return "{\"s\":\"" + String(s) + "\",\"e\":\"" + String(e) + "\",\"recurring\":true" + idField + defIdField +
     codeField + bbField + phField + daysField + ",\"date\":\"" + dateStr + "\"" + activatedField + activatedByField + "}";
@@ -2070,6 +2102,19 @@ bool midnightRollover() {
     // The CURRENT today bucket, read only so a retry of a half-finished rollover
     // can keep activations granted since the earlier pass (see the recurring loop).
     String existingTodayJson = fbGet(base + "/slots");
+    // A failed read of the CURRENT today bucket must never be treated as "empty":
+    // rebuilding from nothing would wipe today's one-time slots and activations.
+    // Skip this room, report the run incomplete, retry on the next throttle.
+    if (existingTodayJson == "error") {
+      Serial.printf("Rollover: could not read room %d today bucket - skipping, will retry\n", i + 1);
+      allOk = false;
+      continue;
+    }
+    // Canonical Sync V2 today bucket: the PWA publishes an activation here FIRST
+    // and mirrors to /rooms second, so after a mid-day rollover (baseline path)
+    // /rooms alone can miss an activation the PWA already shows. Second source,
+    // date-filtered to today so a midnight run never inherits yesterday's.
+    String canonicalTodayJson = fbGet("/slotRecords/room" + String(i + 1) + "/today");
 
     // ── Build new TODAY ───────────────────────────────────────
     // Keep today's recurring slots + add tomorrow's one-time slots
@@ -2099,6 +2144,8 @@ bool midnightRollover() {
       //    leftovers (a normal midnight) never carry over.
       // 2) Otherwise the lookahead activation from the pre-rollover tomorrow bucket.
       if (!findActivatedRecurringInstance(existingTodayJson, String(def.defId), String(sBuf), String(eBuf),
+                                          overrideAt, overrideBy, getDateStr()) &&
+          !findActivatedRecurringInstance(canonicalTodayJson, String(def.defId), String(sBuf), String(eBuf),
                                           overrideAt, overrideBy, getDateStr())) {
         findActivatedRecurringInstance(tomorrowJson, String(def.defId), String(sBuf), String(eBuf), overrideAt, overrideBy, "");
       }
@@ -2114,18 +2161,31 @@ bool midnightRollover() {
     // anywhere, so activatedAt/attempts/lockedUntil/expired must all
     // survive exactly as they are — a slot someone just activated must
     // not have that reset just because rollover ran again today.
+    //
+    // Objects are taken from the bucket JSON itself (existingTodayJson, read
+    // above), never via the RAM slot index used as a Firebase child key — the
+    // compacted/sorted RAM array does not line up with /slots/<n>, so that
+    // fetched the wrong slot or none and dropped bookings.
     String todayDateStr = getDateStr();
-    for (int j = 0; j < rooms[i].slotCount; j++) {
-      if (rooms[i].slots[j].recurring) continue; // already handled above
-      String existingSlot = fbGet(base + "/slots/" + String(j));
-      if (existingSlot == "error" || existingSlot == "null" || existingSlot.length() < 5) continue;
-      if (extractStringField(existingSlot, "date") != todayDateStr) continue; // not today — genuinely stale, drop it
-      // Soft-deleted (PWA's deleteSlot()) — this is the permanent purge the
-      // tombstone was waiting for: just don't carry it into the new today.
-      if (existingSlot.indexOf("\"deleted\":true") >= 0) continue;
-      if (!first) newTodayJson += ",";
-      newTodayJson += existingSlot;
-      first = false;
+    if (existingTodayJson != "null" && existingTodayJson.length() > 2) {
+      int xp = 0;
+      while (xp < (int)existingTodayJson.length()) {
+        int xs = existingTodayJson.indexOf("\"s\":\"", xp);
+        int xe = existingTodayJson.indexOf("\"e\":\"", xp);
+        if (xs < 0 || xe < 0) break;
+        int oStart = existingTodayJson.lastIndexOf('{', xs);
+        int oEnd   = existingTodayJson.indexOf('}', xe);
+        if (oStart < 0 || oEnd < 0) { xp = max(xs, xe) + 10; continue; }
+        String existingSlot = existingTodayJson.substring(oStart, oEnd + 1);
+        xp = oEnd + 1;
+        if (existingSlot.indexOf("\"recurring\":true") >= 0) continue; // regenerated from defs above
+        if (extractStringField(existingSlot, "date") != todayDateStr) continue; // not today — genuinely stale, drop it
+        // Soft-deleted (PWA's deleteSlot()) — permanent purge, don't carry it.
+        if (existingSlot.indexOf("\"deleted\":true") >= 0) continue;
+        if (!first) newTodayJson += ",";
+        newTodayJson += existingSlot;
+        first = false;
+      }
     }
 
     // Move tomorrow's one-time slots into today
@@ -2168,7 +2228,7 @@ bool midnightRollover() {
             // No-code slot → seed activatedAt so it's auto-active after
             // promotion; coded slot → null (re-activation required). Matches
             // the new activatedAt-only rule in parseSlots.
-            String activatedField2 = (c2.length() > 0) ? ",\"activatedAt\":null" : ",\"activatedAt\":1";
+            String activatedField2 = (c2.length() > 0) ? ",\"activatedAt\":null" : ",\"activatedAt\":" + nowEpochMsStr() + ",\"activatedBy\":\"auto\"";
             newTodayJson += "{\"s\":\"" + startStr + "\",\"e\":\"" + endStr + "\"" + idField2 +
               codeField2 + bookedByField2 + phoneField2 + ",\"date\":\"" + getDateStr() + "\"" + activatedField2 + "}";
             first = false;
