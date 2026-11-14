@@ -6,10 +6,19 @@
  *             LittleFS (bundled with modern ESP32 board packages),
  *             WiFi, HTTPClient, WiFiClientSecure (all built-in)
  *
+ *  v6.14 — Diagnostics (observation-only): RAM ring of the last 20 relay changes/boots
+ *  with a reason tag (sched/ovr/delta/legacy/slots/rollov/other/boot), reported as
+ *  /status/diag on the heartbeat PATCH (immediately after an unexpected switch-off).
+ *  No heap/flash/Firebase use in the logging path; heartbeat omits the field on any problem.
+ *
  *  v6.13 — Rollover: id/content-based carry-over, activation not lost mid-day;
  *  no-code slots stamped like the PWA (epoch-ms activatedAt + activatedBy auto,
  *  not a bare 1) and a stale-canonical (lower version) delta can no longer
  *  switch an active slot off:
+ *  - Failed/truncated reads can no longer switch a room off: parseSlots() keeps
+ *    RAM slots on "error"/"" (only a real empty payload clears them), readAllRooms()
+ *    keeps slots on a failed fetch, and every full-slots refresh requires a complete
+ *    (balanced) payload before replacing RAM (validateSlotsJsonForRefresh).
  *  - One-time slots dated today are copied from the already-read today bucket
  *    instead of fetching /slots/<RAM index> (the RAM array is compacted/sorted, so
  *    the index is not the Firebase key and the wrong slot / none was fetched).
@@ -146,6 +155,7 @@ void syncConfigV2();
 int daysMaskFromJson(const String &slotObj);
 String extractStringField(const String &json, const String &field);
 String extractRawField(const String &json, const String &field);
+int findMatchingClose(const String &json, int openIdx);
 void catchUpMissedRollover();
 bool midnightRollover();
 
@@ -487,6 +497,46 @@ void flashStatusLed(int times, int ms) {
   }
 }
 
+// ── Diagnostics: relay-change event log (v6.14) ───────────────
+// Observation-only. A fixed RAM ring buffer of the last DIAG_MAX relay changes
+// (and boots). No heap, no Firebase, no flash, no Serial dependency in the logging
+// path; every index is bounds-checked and nothing here can alter relay behaviour.
+// The text is attached to the existing heartbeat PATCH as /status/diag, built
+// defensively — if anything about it fails, the field is simply omitted.
+#define DIAG_MAX 20
+struct DiagEvt { uint32_t epoch; int8_t room; int8_t state; char why[8]; };
+DiagEvt diagBuf[DIAG_MAX];
+int diagHead = 0;        // next slot to write
+int diagCount = 0;       // valid entries (<= DIAG_MAX)
+const char *diagWhy = "other"; // set by callers just before a state-changing call
+bool diagUrgent = false; // an unexpected switch-off — flush on the next loop tick
+
+void diagLog(int room, int state, const char *why) {
+  if (diagHead < 0 || diagHead >= DIAG_MAX) diagHead = 0;
+  DiagEvt &e = diagBuf[diagHead];
+  e.epoch = (uint32_t)time(nullptr);
+  e.room = (int8_t)room;
+  e.state = (int8_t)state;
+  strncpy(e.why, why ? why : "?", sizeof(e.why) - 1);
+  e.why[sizeof(e.why) - 1] = '\0';
+  diagHead = (diagHead + 1) % DIAG_MAX;
+  if (diagCount < DIAG_MAX) diagCount++;
+}
+
+// Newest first: "epoch,room,state,why;" … ('R' room = boot entry, state = reset reason).
+String diagBuild() {
+  String out;
+  out.reserve(DIAG_MAX * 24);
+  for (int n = 0; n < diagCount && n < DIAG_MAX; n++) {
+    int idx = (diagHead - 1 - n + 2 * DIAG_MAX) % DIAG_MAX;
+    const DiagEvt &e = diagBuf[idx];
+    char line[40];
+    snprintf(line, sizeof(line), "%lu,%d,%d,%s;", (unsigned long)e.epoch, (int)e.room, (int)e.state, e.why);
+    out += line;
+  }
+  return out;
+}
+
 // ── Relay + LED — only fires GPIO if state truly changes ──────
 void setRelay(int idx, bool on) {
   // Always write to hardware — don't trust software state matches physical state
@@ -505,6 +555,11 @@ void setRelay(int idx, bool on) {
   if (rooms[idx].lightOn != on) {
     rooms[idx].lightOn = on;
     Serial.printf("[%s] Room %d → %s\n", getTime().c_str(), idx+1, on?"ON":"OFF");
+    // Diagnostics only (observation; cannot affect the relay). Log, flag an
+    // unexpected switch-off for prompt reporting, then clear the reason tag.
+    diagLog(idx + 1, on ? 1 : 0, diagWhy);
+    if (!on && strcmp(diagWhy, "sched") != 0 && strcmp(diagWhy, "ovr") != 0) diagUrgent = true;
+    diagWhy = "other";
   }
   updateEmergencyLight(); // re-check "are all rooms off" every time any one room's state settles
 }
@@ -714,8 +769,18 @@ bool pushHeartbeat() {
                 ",\"lastSeenEpoch\":" + String((unsigned long)time(nullptr)) +
                 ",\"lights\":\"" + lightsString() + "\"" +
                 ",\"staleSlots\":" + String(staleSlotsDetected ? "true" : "false") +
-                ",\"staleRooms\":" + String(staleRoomsMask) + "}";
-  return fbPatch("/status", body);
+                ",\"staleRooms\":" + String(staleRoomsMask);
+  // Diagnostics (v6.14): strictly additive and optional — any problem building it
+  // just leaves the field out; the heartbeat itself is unaffected.
+  String diagStr = diagBuild();
+  String bodyPlain = body + "}";   // heartbeat exactly as before v6.14
+  bool hasDiag = (diagStr.length() > 0 && diagStr.length() < 1200);
+  if (hasDiag) body += ",\"diag\":\"" + diagStr + "\"";
+  body += "}";
+  if (fbPatch("/status", body)) return true;
+  // If the diag-bearing write failed, retry the plain heartbeat so diagnostics can
+  // never cost a heartbeat.
+  return hasDiag ? fbPatch("/status", bodyPlain) : false;
 }
 
 // Boot: write every room's lightOn once so Firebase can't keep a stale value
@@ -797,7 +862,11 @@ void parseRecurDefs(int idx, String json) {
 }
 
 void parseSlots(int idx, String json) {
-  if (json == "null" || json == "" || json == "error" || json.length() < 5) {
+  // A failed/empty READ ("error", "") says nothing about the room's slots —
+  // never let it wipe them (that switched the room off). Only a real "no slots"
+  // payload ("null", "[]", other short bodies) clears the list.
+  if (json == "error" || json == "") return;
+  if (json == "null" || json.length() < 5) {
     rooms[idx].slotCount = 0;
     return;
   }
@@ -974,6 +1043,9 @@ bool applyCanonicalSlotDelta(const String &roomId, const String &bucket,
   // ESP32 drives today's schedule only. Tomorrow changes are consumed by the
   // next daily full refresh after rollover.
   if (bucket != "today") return true;
+  diagWhy = "delta";
+  // An empty id would match the first id-less slot in the room — never act on it.
+  if (recordId.length() == 0) return false;
   int ri = roomIndexFromId(roomId);
   if (ri < 0) return false;
   int existing = findLocalSlotById(ri, recordId);
@@ -1159,6 +1231,13 @@ bool validateSlotsJsonForRefresh(const String &json) {
     sawValidSlotObject = true;
     pos = objEnd + 1;
   }
+  // Completeness: a response cut short mid-transfer still parses its leading slots
+  // and would silently DROP the rest (e.g. the one activated slot) from RAM, turning
+  // that room off. Require the top-level array/object to close at the very end.
+  char c0 = trimmed[0];
+  if (c0 == '[' || c0 == '{') {
+    if (findMatchingClose(trimmed, 0) != (int)trimmed.length() - 1) return false;
+  }
   return sawValidSlotObject;
 }
 
@@ -1172,6 +1251,7 @@ bool refreshOneRoomFromLegacy(int roomIdx) {
     return false;
   }
   if (raw == "null") raw = "[]";
+  diagWhy = "legacy";
   parseSlots(roomIdx, raw);
   applyState(roomIdx);
   Serial.printf("Sync V2: room %d refreshed from /rooms fallback (%d slots)\n",
@@ -1694,8 +1774,12 @@ void readAllRooms() {
     } else {
       // Firebase nested format — fetch directly for this room
       String slotJson = fbGet("/rooms/room" + String(i + 1) + "/slots");
-      if (slotJson != "error" && slotJson != "null" && slotJson.length() > 2) {
-        parseSlots(i, slotJson);
+      if (slotJson == "error") {
+        // A failed read is NOT "no slots" — keep this room's current RAM slots.
+        Serial.printf("readAllRooms: room %d slots read failed - keeping existing slots\n", i + 1);
+      } else if (slotJson != "null" && slotJson.length() > 2) {
+        if (validateSlotsJsonForRefresh(slotJson)) parseSlots(i, slotJson);
+        else Serial.printf("readAllRooms: room %d slots payload incomplete - keeping existing slots\n", i + 1);
       } else {
         rooms[i].slotCount = 0;
       }
@@ -1725,6 +1809,13 @@ void refreshSlotsOnly() {
     if (marker != "error") lastSlotsMarker[i] = marker;
 
     String slotJson = fbGet("/rooms/room" + String(i+1) + "/slots");
+    // Only a complete, well-formed payload may replace this room's RAM slots; a
+    // truncated read keeps the previous state (and re-reads next cycle).
+    if (slotJson != "error" && !validateSlotsJsonForRefresh(slotJson)) {
+      Serial.printf("refreshSlotsOnly: room %d payload incomplete - keeping previous state\n", i + 1);
+      lastSlotsMarker[i] = "";   // force a re-read next cycle
+      slotJson = "error";
+    }
     if (slotJson != "error") {
       // Save previous state for comparison
       int  prevCount = rooms[i].slotCount;
@@ -1757,6 +1848,7 @@ void refreshSlotsOnly() {
       }
 
       if (needsReapply) {
+        diagWhy = "slots";
         applyState(i);
       }
     }
@@ -1810,6 +1902,7 @@ void pollOverrides() {
     if (newOvr != rooms[i].ovr) {
       Serial.printf("Room %d override: %d → %d\n", i+1, rooms[i].ovr, newOvr);
       rooms[i].ovr = newOvr;
+      diagWhy = "ovr";
       applyState(i);
       pushStatus(i);
     }
@@ -2293,6 +2386,7 @@ bool midnightRollover() {
   bool prevOn[MAX_ROOMS];
   int snapCount = (roomCount < MAX_ROOMS) ? roomCount : MAX_ROOMS;
   for (int i = 0; i < snapCount; i++) prevOn[i] = rooms[i].lightOn;
+  diagWhy = "rollov";
   unsigned long savedOnSince = emergencyOnSince;
   bool savedLatched = emergencyLatchedOff;
   applyAllStates();
@@ -2695,6 +2789,7 @@ void checkSchedules() {
         getTime().c_str(), i+1,
         rooms[i].lightOn ? "ON" : "OFF",
         shouldOn ? "ON" : "OFF");
+      diagWhy = "sched";
       setRelay(i, shouldOn);
       pushStatus(i);
     }
@@ -2847,7 +2942,8 @@ void setup() {
   // fresh timeout. A power-on or brownout reset is a real outage — start clean so
   // the emergency light comes on as usual, and drop any stale latch file.
   esp_reset_reason_t rr = esp_reset_reason();
-  Serial.printf("Reset reason: %d (1=power-on 3=software 4=panic 5/6/7=watchdog 15=brownout)\n", (int)rr);
+  diagLog(0, (int)rr, "boot"); // diagnostics: boot entry, state = reset reason code
+  Serial.printf("Reset reason: %d (1=power-on 3=software 4=panic 5/6/7=watchdog 9=brownout)\n", (int)rr);
   emergencyLatchPersisted = LittleFS.exists(EMERGENCY_LATCH_PATH);
   if (emergencyLatchPersisted) {
     if (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT) {
@@ -3060,6 +3156,8 @@ void loop() {
   }
 
   // Heartbeat every 5 minutes
+  // An unexpected switch-off was logged — report it now instead of waiting for the 5-min beat.
+  if (diagUrgent) { diagUrgent = false; lastStatusPush = millis() - HEARTBEAT - 1; }
   if (millis() - lastStatusPush > HEARTBEAT) {
     lastStatusPush = millis();
     // Only when WiFi is up (otherwise it just burns a 5 s timeout). A failed or

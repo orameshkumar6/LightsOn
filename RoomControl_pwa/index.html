@@ -617,6 +617,14 @@
         <button class="test-btn" style="margin:0" onclick="forceAllRoomsRollover()">Force slot rollover now</button>
       </div>
     </div>
+    <div class="settings-section">
+      <div class="settings-title">Controller diagnostics</div>
+      <div class="settings-sub" style="padding:0 14px 8px">The last relay changes and reboots reported by the board with each heartbeat (ESP32 v6.14+), newest first. Reason: sched = schedule, ovr = manual override, delta/legacy/slots = slot sync, rollov = rollover, boot = (re)start.</div>
+      <div id="ctrlDiagList" style="padding:0 14px 10px;font:12px/1.5 monospace;white-space:pre-wrap">No data yet.</div>
+      <div class="settings-row">
+        <button class="test-btn" style="margin:0" onclick="copyControllerDiag()">Copy</button>
+      </div>
+    </div>
     <div class="settings-section license-exempt">
       <div class="settings-title">Activity report</div>
       <div class="settings-sub" style="padding:0 14px 8px">A 30-day history of product activity — slots created, updated, deleted, activated, and deactivated mid-session, plus manual overrides, shown day by day with charts. Data is read only when you open the report.</div>
@@ -7548,7 +7556,31 @@ function applyControllerStatus(st) {
   // Board-reported desync: marker says "rolled over today" but a room's today
   // bucket still holds a past-dated one-time slot (detect-only, ESP32 v6.12+).
   controllerStaleSlots = !!(st && st.staleSlots === true);
+  renderControllerDiag(st && st.diag);
   renderControllerStatus();
+}
+
+// Board diagnostics (ESP32 v6.14+): "epoch,room,state,why;" newest first.
+// Display-only and fully guarded — a malformed/missing field can never affect status.
+let controllerDiagText = '';
+function renderControllerDiag(raw) {
+  try {
+    const el = document.getElementById('ctrlDiagList');
+    if (!el) return;
+    if (typeof raw !== 'string' || !raw) { controllerDiagText = ''; el.textContent = 'No data yet (needs ESP32 v6.14+).'; return; }
+    const lines = raw.split(';').filter(Boolean).map(rec => {
+      const [t, room, state, why] = rec.split(',');
+      const ms = Number(t) * 1000;
+      const when = ms > 1e12 ? new Date(ms).toLocaleString([], { hour12:false, timeZone:'Asia/Kolkata' }) : '(clock not set)';
+      if (room === '0') return `${when}  BOOT  reset reason ${state}`;
+      return `${when}  Room ${room} ${state === '1' ? 'ON ' : 'OFF'}  [${why}]`;
+    });
+    controllerDiagText = lines.join('\n');
+    el.textContent = controllerDiagText;
+  } catch (e) { /* diagnostics must never break status */ }
+}
+function copyControllerDiag() {
+  try { navigator.clipboard.writeText(controllerDiagText || 'No data'); showToast('Copied'); } catch (e) { showToast('Copy not available'); }
 }
 
 // Re-render the pill from the last-read timestamp. Called on a timer so it
